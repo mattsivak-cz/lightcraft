@@ -69,6 +69,11 @@ const MODULES: &[Module] = &[
         bindings: &[("src", false, "f32"), ("dst", true, "f32"), ("coverage", false, "u32")],
         entries: &["orient", "sample_affine", "sample_warp"],
     },
+    Module {
+        src: include_str!("wgsl/present.wgsl"),
+        bindings: &[("src", false, "u32"), ("dst", true, "u32"), ("stats", true, "atomic<u32>")],
+        entries: &["pad_rows"],
+    },
 ];
 
 struct Kernel {
@@ -243,6 +248,10 @@ pub struct Gpu {
     free: std::sync::Mutex<Vec<Tracked>>,
     /// Largest storage buffer the device accepts (bytes).
     pub max_buffer: u64,
+    /// Largest texture side the device accepts.
+    pub max_texture: u32,
+    /// The window's device ([`Gpu::shared`]): renders can be handed to the window as textures.
+    pub shared: bool,
 }
 
 /// WGSL constants shared by every module (generated from the CPU pipeline's values).
@@ -327,9 +336,31 @@ impl Gpu {
             ..Default::default()
         }))
         .map_err(|e| format!("{}: device creation failed ({e})", info.name))?;
+        Gpu::build(device, queue, info, false)
+    }
+
+    /// Render on the device the window created (issue #1228): renders then reach the screen as
+    /// textures on that device, with no copy back to the CPU. Refused as [`Gpu::new`] refuses an
+    /// adapter: a software one, or one with too few storage buffers for the kernels.
+    pub fn shared(device: wgpu::Device, queue: wgpu::Queue, info: wgpu::AdapterInfo) -> Result<Gpu, String> {
+        if info.device_type == wgpu::DeviceType::Cpu {
+            return Err(format!("software adapter ({}) skipped: the CPU pipeline is faster", info.name));
+        }
+        let n = device.limits().max_storage_buffers_per_shader_stage;
+        if n < 10 {
+            return Err(format!("{} has too few storage buffers per shader stage ({n} < 10)", info.name));
+        }
+        Gpu::build(device, queue, info, true)
+    }
+
+    /// Install the error handlers and compile the kernels on `device`.
+    fn build(device: wgpu::Device, queue: wgpu::Queue, info: wgpu::AdapterInfo, shared: bool) -> Result<Gpu, String> {
         // Errors outside a render's error scopes (see `ErrorScopes`): log, and stop using the GPU.
-        device.on_uncaptured_error(std::sync::Arc::new(|e| {
-            log::error!("gpu: {e}");
+        // On the window's device this covers the window's own errors too (its handler only
+        // logged): renders then go back to the CPU, and to textures egui uploads itself.
+        let what = if shared { "gpu (window device)" } else { "gpu" };
+        device.on_uncaptured_error(std::sync::Arc::new(move |e| {
+            log::error!("{what}: {e}");
             crate::mark_broken(&format!("device error: {e}"));
         }));
         // wgpu reports a lost device (driver reset, GPU hang, watchdog) only here — never as an
@@ -378,9 +409,16 @@ impl Gpu {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        let max_buffer = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
-        log::info!("gpu: {} ({:?}), buffers ≤ {} MiB", info.name, info.backend, max_buffer >> 20);
-        Ok(Gpu { device, queue, info, kernels, dummy, free: Default::default(), max_buffer })
+        let limits = device.limits();
+        let mut max_buffer = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
+        // (a device of our own was requested with these limits already; the window's was not)
+        if let Some((binding, buffer)) = limits_override() {
+            max_buffer = max_buffer.min(binding).min(buffer);
+        }
+        let max_texture = limits.max_texture_dimension_2d;
+        let with = if shared { ", shared with the window" } else { "" };
+        log::info!("gpu: {} ({:?}){with}, buffers ≤ {} MiB", info.name, info.backend, max_buffer >> 20);
+        Ok(Gpu { device, queue, info, kernels, dummy, free: Default::default(), max_buffer, max_texture, shared })
     }
 
     /// A buffer of `len` 32-bit values with undefined contents (a recycled one when possible).
