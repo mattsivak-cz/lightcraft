@@ -69,7 +69,7 @@ impl eframe::App for App {
             // Quit from the menu bar: save exactly what closing the window saves (settings and
             // library, after the unsaved-changes check; otherwise its prompt shows), then end the
             // process instead of closing the viewport while AppKit is terminating (PR #444).
-            eframe::App::on_exit(self, None);
+            self.save_and_shut_down();
             std::process::exit(0);
         }
         self.0.logic(ctx);
@@ -85,6 +85,25 @@ impl eframe::App for App {
         self.0.ui(ui);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_and_shut_down();
+        // macOS (#1331): end the process here, before eframe tears the window down, as Quit from
+        // the menu bar already does (PR #444). AccessKit's macOS adapter subclasses the window's
+        // content view and restores its class on teardown; AppKit's Touch Bar support observes
+        // that view (KVO), so in the next display cycle `-[_NSTouchBarFinderObservation
+        // invalidate]` throws "not registered" and closing the window ends in a crash report.
+        // Nothing after this is needed: settings and library are saved, background work has
+        // stopped and the log file is unbuffered. `on_exit` only runs once the app exists, so a
+        // renderer that fails to start still relaunches on the next one (`window_gpu`).
+        #[cfg(target_os = "macos")]
+        std::process::exit(0);
+    }
+}
+
+impl App {
+    /// Save settings and the library, then wait for background work: closing the window, Quit
+    /// from the macOS menu bar, or starting again after a lost graphics device (which must not
+    /// end the process here, so the macOS exit stays in `on_exit`).
+    fn save_and_shut_down(&mut self) {
         // (a size the window was just given is remembered too)
         self.0.ui.window = self.1.window_at_exit(self.0.ui.window);
         if let Err(e) = self.1.save(&self.0) {
@@ -97,16 +116,6 @@ impl eframe::App for App {
         if !self.0.shutdown(EXIT_WAIT) {
             log::warn!("quit: background work was still running after {EXIT_WAIT:?}");
         }
-        // macOS (#1331): end the process here, before eframe tears the window down, as Quit from
-        // the menu bar already does (PR #444). AccessKit's macOS adapter subclasses the window's
-        // content view and restores its class on teardown; AppKit's Touch Bar support observes
-        // that view (KVO), so in the next display cycle `-[_NSTouchBarFinderObservation
-        // invalidate]` throws "not registered" and closing the window ends in a crash report.
-        // Nothing after this is needed: settings and library are saved, background work has
-        // stopped and the log file is unbuffered. `on_exit` only runs once the app exists, so a
-        // renderer that fails to start still relaunches on the next one (`window_gpu`).
-        #[cfg(target_os = "macos")]
-        std::process::exit(0);
     }
 }
 
