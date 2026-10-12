@@ -345,6 +345,17 @@ pub fn upper_first(text: &str) -> String {
     }
 }
 
+/// The native dialog shown when the window's graphics device was lost mid-session (issue #1228):
+/// title, text, and the two buttons (restart, quit).
+pub fn device_lost_message() -> (String, String, String, String) {
+    (
+        tr("LightCraft lost its graphics device").to_string(),
+        tr("The graphics driver stopped responding, so LightCraft can't draw its window any more. Your library and edits are saved.\n\nRestart LightCraft to continue.").to_string(),
+        tr("Restart").to_string(),
+        tr("Quit").to_string(),
+    )
+}
+
 /// A stock preset's or profile's name in the UI language; an imported or user-edited name stays
 /// exactly as its owner wrote it.
 pub fn builtin_label(source: &str, builtin: bool) -> &str {

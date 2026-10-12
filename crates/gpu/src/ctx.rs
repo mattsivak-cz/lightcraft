@@ -71,7 +71,7 @@ const MODULES: &[Module] = &[
     },
     Module {
         src: include_str!("wgsl/present.wgsl"),
-        bindings: &[("src", false, "u32"), ("dst", true, "u32"), ("stats", true, "atomic<u32>")],
+        bindings: &[("src", false, "u32"), ("dst", true, "u32"), ("stats", true, "atomic<u32>"), ("curves", false, "u32")],
         entries: &["pad_rows"],
     },
 ];
@@ -365,10 +365,15 @@ impl Gpu {
         }));
         // wgpu reports a lost device (driver reset, GPU hang, watchdog) only here — never as an
         // error — so without this callback a lost device went unnoticed.
-        device.set_device_lost_callback(|reason, msg| {
+        // On the window's device the window loses it too (it can't draw again until restarted):
+        // `window_device_lost` tells the app.
+        device.set_device_lost_callback(move |reason, msg| {
             DEVICE_LOST.store(true, Ordering::Relaxed);
-            log::error!("gpu: device lost ({reason:?}): {msg}");
+            log::error!("{what}: device lost ({reason:?}): {msg}");
             crate::mark_broken(&format!("device lost ({reason:?}): {msg}"));
+            if shared {
+                crate::WINDOW_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         });
         // a kernel the driver's compiler refuses is a validation or an internal error: no GPU, not a half-built one
         let scopes = [device.push_error_scope(wgpu::ErrorFilter::Validation), device.push_error_scope(wgpu::ErrorFilter::Internal)];
@@ -654,6 +659,60 @@ impl Gpu {
         drop(data);
         staging.unmap();
         out
+    }
+}
+
+impl Gpu {
+    /// The pixels of an `Rgba8Unorm` texture on this device (a render handed to the window, read
+    /// back for a screenshot), or why not.
+    pub fn read_texture(&self, texture: &wgpu::Texture) -> Result<lightcraft_raster::Rgba8, String> {
+        let (w, h) = (texture.width() as usize, texture.height() as usize);
+        if texture.format() != wgpu::TextureFormat::Rgba8Unorm || !texture.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+            return Err("not a render texture".into());
+        }
+        let stride = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+        let size = (stride * h) as u64;
+        if size == 0 || size > self.device.limits().max_buffer_size {
+            return Err(format!("a {w}×{h} texture can't be read back"));
+        }
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("texture readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.encoder();
+        enc.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride as u32), rows_per_image: Some(h as u32) },
+            },
+            wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(READBACK_TIMEOUT) }).map_err(|e| e.to_string())?;
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(e) => return Err(format!("map callback: {e}")),
+        }
+        let data = slice.get_mapped_range().map_err(|e| format!("{e:?}"))?;
+        let mut out = Vec::with_capacity(w * h);
+        for row in data.chunks(stride) {
+            out.extend_from_slice(row.get(..w * 4).unwrap_or_default().as_chunks::<4>().0);
+        }
+        drop(data);
+        staging.unmap();
+        if out.len() != w * h {
+            return Err("the texture came back incomplete".into());
+        }
+        Ok(lightcraft_raster::Rgba8 { width: w, height: h, data: out })
     }
 }
 

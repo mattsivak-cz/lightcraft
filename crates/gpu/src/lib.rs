@@ -306,6 +306,18 @@ pub fn window_device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
     wgpu::Limits { max_texture_dimension_2d: limits.max_texture_dimension_2d.max(8192), ..limits }
 }
 
+/// Set when the device lent by [`share_window_device`] was lost (driver reset, GPU hang).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+static WINDOW_LOST: AtomicBool = AtomicBool::new(false);
+
+/// Whether the window's device, lent to renders ([`share_window_device`]), was lost: renders
+/// have gone back to the CPU, but the window can't draw on it again either. The app then offers
+/// a restart (with a device of its own for renders: `LIGHTCRAFT_GPU_TEXTURES=0`). A device lost
+/// while renders had their own leaves the window alone, and this stays false.
+pub fn window_device_lost() -> bool {
+    WINDOW_LOST.load(Ordering::Relaxed)
+}
+
 /// Whether renders run on the window's device, so [`try_render_texture`] can hand them over
 /// without a readback. Never creates the device.
 pub fn shares_window_device() -> bool {
@@ -569,13 +581,15 @@ pub fn texture_handles(req: &RenderRequest) -> bool {
 /// [`try_render`] into a texture on the window's device, with no copy of the image back to the
 /// CPU (issue #1228): for views that only draw it, such as the loupe's zoom window. There is no
 /// histogram. [`Fallback::NotTried`] when [`texture_handles`] says no; the caller then renders
-/// with [`try_render`] (or on the CPU).
+/// with [`try_render`] (or on the CPU). `curves`: a display profile's per-channel correction
+/// ([`lightcraft_codecs`' `DisplayProfile::correction_curves`]), applied on the way into the texture.
 pub fn try_render_texture(
     src: &Arc<Rgb32f>,
     info: &SourceInfo,
     s: &DevelopSettings,
     req: &RenderRequest,
     stages: Option<&StageCache>,
+    curves: Option<&[[u8; 256]; 3]>,
 ) -> Result<GpuTexture, Fallback> {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -588,14 +602,45 @@ pub fn try_render_texture(
             stages,
             |t: &GpuTexture| (t.width, t.height),
             |gpu, s, ext, fault| {
-                if gpu.shared { render::render_texture(gpu, src, info, s, req, ext, fault) } else { None }
+                if gpu.shared { render::render_texture(gpu, src, info, s, req, ext, fault, curves) } else { None }
             },
         )
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (src, info, s, req, stages);
+        let _ = (src, info, s, req, stages, curves);
         Err(Fallback::NotTried)
+    }
+}
+
+/// The pixels of a render handed over as a texture ([`try_render_texture`]), read back from the
+/// device: for what can't draw it there (a headless screenshot). `None` once the device is gone.
+pub fn read_texture(t: &GpuTexture) -> Option<lightcraft_raster::Rgba8> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _work = exit::enter()?;
+        let gpu = existing_device()?;
+        gpu.read_texture(&t.texture).map_err(|e| log::warn!("gpu: reading a render texture back: {e}")).ok()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = t;
+        None
+    }
+}
+
+/// `LIGHTCRAFT_GPU_LOSE_AFTER=<n>`: after `n` GPU renders the device is destroyed, as a driver
+/// reset or GPU hang loses it — to see the app recover (renders back on the CPU; with a device
+/// shared with the window, the restart it offers). A testing switch, like `LIGHTCRAFT_GPU_LIMITS`.
+#[cfg(not(target_arch = "wasm32"))]
+fn lose_device_when_asked(gpu: &ctx::Gpu) {
+    static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(n) = *AFTER.get_or_init(|| std::env::var("LIGHTCRAFT_GPU_LOSE_AFTER").ok().and_then(|v| v.trim().parse().ok())) else { return };
+    if DONE.fetch_add(1, Ordering::Relaxed) + 1 == n {
+        log::warn!("gpu: LIGHTCRAFT_GPU_LOSE_AFTER={n}: destroying the device");
+        gpu.device.destroy();
+        let _ = gpu.device.poll(wgpu::PollType::Poll);
     }
 }
 
@@ -672,7 +717,10 @@ fn attempt<T>(
         (Ok(Some(_)), None) if BROKEN.load(Ordering::Relaxed) => {
             format!("device failure during the render: {}", unavailable_reason().unwrap_or_default())
         }
-        (Ok(Some(r)), None) => return Ok(r),
+        (Ok(Some(r)), None) => {
+            lose_device_when_asked(gpu);
+            return Ok(r);
+        }
         // every path of `render::render` that gives up records a failure first; should one
         // not, the CPU renders it rather than nothing
         (Ok(None), None) => "GPU render: no image came back".to_string(),

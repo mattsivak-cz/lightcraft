@@ -586,14 +586,15 @@ pub fn render(
     stages: Option<&GpuStages>,
     fault: Option<crate::Fault>,
 ) -> Option<Rendered> {
-    match render_as(gpu, src, info, s, req, stages, fault, false)? {
+    match render_as(gpu, src, info, s, req, stages, fault, None)? {
         Made::Pixels(r) => Some(r),
         Made::Texture(_) => None,
     }
 }
 
 /// [`render`] into a texture on the window's device (issue #1228): no copy back to the CPU, no
-/// histogram and no overlay (the caller asks [`crate::texture_handles`] first).
+/// histogram and no overlay (the caller asks [`crate::texture_handles`] first). `curves`: a
+/// display profile's per-channel correction, applied on the way into the texture.
 #[allow(clippy::too_many_arguments)]
 pub fn render_texture(
     gpu: &Gpu,
@@ -603,8 +604,9 @@ pub fn render_texture(
     req: &RenderRequest,
     stages: Option<&GpuStages>,
     fault: Option<crate::Fault>,
+    curves: Option<&[[u8; 256]; 3]>,
 ) -> Option<crate::GpuTexture> {
-    match render_as(gpu, src, info, s, req, stages, fault, true)? {
+    match render_as(gpu, src, info, s, req, stages, fault, Some(curves))? {
         Made::Texture(t) => Some(t),
         Made::Pixels(_) => None,
     }
@@ -625,7 +627,7 @@ fn render_as(
     req: &RenderRequest,
     stages: Option<&GpuStages>,
     fault: Option<crate::Fault>,
-    texture: bool,
+    texture: Option<Option<&[[u8; 256]; 3]>>,
 ) -> Option<Made> {
     let mut t = profiling().then(std::time::Instant::now);
     // Each stage is submitted on its own; under `LIGHTCRAFT_PROFILE` also waited for, so the
@@ -752,8 +754,8 @@ fn render_as(
             groups2(w, rows.min(h - y0), [16, 16]),
         );
     }
-    if texture {
-        let made = to_texture(&mut cx, &out, w, h, plan.keep.map(|k| (k.x, k.y, k.w, k.h)));
+    if let Some(curves) = texture {
+        let made = to_texture(&mut cx, &out, w, h, plan.keep.map(|k| (k.x, k.y, k.w, k.h)), curves);
         lap("finish + present", &mut t, &mut cx);
         return made.map(Made::Texture);
     }
@@ -833,7 +835,14 @@ fn render_as(
 /// RGBA8 output `out` into a new texture, with the checks the read-back path runs on the CPU: a
 /// pixel the per-pixel kernel never wrote fails the render, an entirely black one is redone on the
 /// CPU. Only two counters come back from the device.
-fn to_texture(cx: &mut Cx<'_>, out: &Buf, w: usize, h: usize, keep: Option<(usize, usize, usize, usize)>) -> Option<crate::GpuTexture> {
+fn to_texture(
+    cx: &mut Cx<'_>,
+    out: &Buf,
+    w: usize,
+    h: usize,
+    keep: Option<(usize, usize, usize, usize)>,
+    curves: Option<&[[u8; 256]; 3]>,
+) -> Option<crate::GpuTexture> {
     let gpu = cx.gpu;
     let (x0, y0, kw, kh) = keep.unwrap_or((0, 0, w, h));
     // a crop past the output would read past `out`: never expected, but not a reason to crash
@@ -850,8 +859,10 @@ fn to_texture(cx: &mut Cx<'_>, out: &Buf, w: usize, h: usize, keep: Option<(usiz
     let stride = kw.div_ceil(align) * align;
     let padded = cx.gpu.buffer(stride * kh);
     let stats = cx.zeroed(2);
-    let p = [w as u32, x0 as u32, y0 as u32, kw as u32, kh as u32, stride as u32];
-    cx.run("pad_rows", &p, &[Some(out), Some(&padded), Some(&stats)], groups2(kw, kh, [16, 16]));
+    // the display's per-channel tables, one word per entry
+    let tables = curves.map(|c| gpu.upload(&c.iter().flatten().map(|v| *v as u32).collect::<Vec<u32>>()));
+    let p = [w as u32, x0 as u32, y0 as u32, kw as u32, kh as u32, stride as u32, curves.is_some() as u32];
+    cx.run("pad_rows", &p, &[Some(out), Some(&padded), Some(&stats), tables.as_ref()], groups2(kw, kh, [16, 16]));
     if crate::ctx::failed() {
         return None;
     }

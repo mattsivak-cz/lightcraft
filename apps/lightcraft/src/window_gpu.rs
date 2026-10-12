@@ -149,8 +149,103 @@ pub fn base_options() -> WgpuConfiguration {
         n.instance_descriptor.backend_options = backend::backend_options();
         // no indirect-call validation pipeline: Intel Metal fails to compile it and the window never opens (#250)
         n.instance_descriptor.flags = backend::instance_flags_from_env(n.instance_descriptor.flags);
+        // the adapter's limits, so renders can share the device and hand the window textures (#1228)
+        n.device_descriptor = std::sync::Arc::new(|adapter| wgpu::DeviceDescriptor {
+            label: Some("egui wgpu device"),
+            required_limits: lightcraft_engine::gpu::window_device_limits(adapter),
+            ..Default::default()
+        });
     }
     c
+}
+
+/// Renders that stay on the GPU (issue #1228), drawn through the window's egui-wgpu renderer: they
+/// are made on its device ([`lend_device`]) and registered as its textures.
+pub struct WindowTextures(eframe::egui_wgpu::RenderState);
+
+impl lightcraft_ui_egui::render::NativeTextures for WindowTextures {
+    fn register(&self, texture: &lightcraft_engine::gpu::GpuTexture) -> Option<egui::TextureId> {
+        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // linear filtering, clamped edges: what egui's own render textures use (`TextureOptions::LINEAR`)
+        Some(self.0.renderer.write().register_native_texture(&self.0.device, &view, wgpu::FilterMode::Linear))
+    }
+
+    fn free(&self, id: egui::TextureId) {
+        self.0.renderer.write().free_texture(&id);
+    }
+}
+
+/// Lend the window's device to the GPU renderer, before anything renders: renders then come back
+/// as textures on it, which [`WindowTextures`] (returned) draws. `None` with the glow renderer,
+/// or when the window's adapter can't run the kernels — renders then keep a device of their own.
+pub fn lend_device(render_state: Option<&eframe::egui_wgpu::RenderState>) -> Option<WindowTextures> {
+    // `LIGHTCRAFT_GPU_TEXTURES=0`: renders keep a device of their own and come back as pixels
+    // (a driver that misbehaves with a shared device; A/B measurements)
+    if std::env::var("LIGHTCRAFT_GPU_TEXTURES").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")) {
+        return None;
+    }
+    let rs = render_state?;
+    let info = rs.adapter.get_info();
+    // (a software adapter: the CPU pipeline is faster; the render device refuses it too)
+    if info.device_type == wgpu::DeviceType::Cpu {
+        return None;
+    }
+    lightcraft_engine::gpu::share_window_device(rs.device.clone(), rs.queue.clone(), info);
+    Some(WindowTextures(rs.clone()))
+}
+
+/// The answer to the lost-device dialog: `None` until it was shown, `Some(None)` while it is
+/// open, then `Some(Some(restart))`.
+static LOST_ANSWER: std::sync::Mutex<Option<Option<bool>>> = std::sync::Mutex::new(None);
+
+/// The window's device was lost (`lightcraft_engine::gpu::window_device_lost`; issue #1228): the
+/// window can't draw on it again. Asks once, in a native dialog on its own thread (no GPU needed),
+/// whether to restart or quit; `Some(restart)` once answered. Without a dialog to click away
+/// (`LIGHTCRAFT_NO_PREFS`: tests, scripts) the answer is quit.
+pub fn device_lost_answer(ctx: &egui::Context) -> Option<bool> {
+    let mut answer = LOST_ANSWER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(a) = *answer {
+        return a;
+    }
+    log::error!("window: the graphics device was lost; LightCraft can't draw its window any more");
+    if std::env::var_os("LIGHTCRAFT_NO_PREFS").is_some() {
+        *answer = Some(Some(false));
+        return Some(false);
+    }
+    *answer = Some(None);
+    let ctx = ctx.clone();
+    let asked = std::thread::Builder::new().name("device-lost".into()).spawn(move || {
+        let (title, text, restart, quit) = lightcraft_ui_egui::i18n::device_lost_message();
+        let r = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title(title)
+            .set_description(text)
+            .set_buttons(rfd::MessageButtons::OkCancelCustom(restart.clone(), quit))
+            .show();
+        let again = matches!(&r, rfd::MessageDialogResult::Custom(b) if *b == restart) || r == rfd::MessageDialogResult::Ok;
+        *LOST_ANSWER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Some(again));
+        ctx.request_repaint();
+    });
+    if asked.is_err() {
+        // no thread for the dialog: start again rather than leave a window that can't draw
+        *answer = Some(Some(true));
+        return Some(true);
+    }
+    None
+}
+
+/// Start LightCraft again after the window's device was lost, with the arguments it was started
+/// with and renders on a device of their own (`LIGHTCRAFT_GPU_TEXTURES=0`): a driver that loses
+/// shared devices can't take the new window down with a render.
+pub fn relaunch_with_own_render_device() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    log::warn!("window: starting again, renders on a device of their own");
+    std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("LIGHTCRAFT_GPU_TEXTURES", "0")
+        .spawn()
+        .map_err(|e| log::error!("window: could not start again: {e}"))
+        .is_ok()
 }
 
 /// The first renderer of `order` that probes cleanly (glow is taken without a probe).
@@ -187,10 +282,10 @@ fn probe(backends: Backends) -> Result<WgpuSetupExisting, String> {
         ..Default::default()
     }))
     .map_err(|e| format!("no adapter: {e}"))?;
-    let base = if adapter.get_info().backend == wgpu::Backend::Gl { wgpu::Limits::downlevel_webgl2_defaults() } else { wgpu::Limits::default() };
+    // (as `base_options` asks: renders can share the device)
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("egui wgpu device"),
-        required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, ..base },
+        required_limits: lightcraft_engine::gpu::window_device_limits(&adapter),
         ..Default::default()
     }))
     .map_err(|e| format!("{}: no device: {e}", adapter.get_info().name))?;
@@ -333,5 +428,95 @@ mod tests {
         .unwrap();
         // outside a scope: logged by our handler, not a panic
         let _ = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl("not wgsl".into()) });
+    }
+
+    /// Issue #1228: renders share the window's device, so a lost device (driver reset, GPU hang)
+    /// is lost to the window too. egui-wgpu panics drawing a frame with anything in it there (its
+    /// staging buffers can't be made), so the app draws empty frames once the device is lost and
+    /// offers a restart (`main.rs`). An empty frame — a render's native texture registered on the
+    /// lost device, textures uploaded, the frame recorded and submitted, textures freed — must
+    /// not panic.
+    #[test]
+    fn a_lost_window_device_draws_empty_frames_without_a_panic() {
+        use eframe::egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: backend::window_backends(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let desc = wgpu::DeviceDescriptor { required_limits: lightcraft_engine::gpu::window_device_limits(&adapter), ..Default::default() };
+        let Ok((device, queue)) = pollster::block_on(adapter.request_device(&desc)) else { return };
+        install_error_handler(&device);
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let mut renderer = Renderer::new(&device, format, RendererOptions::default());
+        let render = |size: u32| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let shown = renderer.register_native_texture(&device, &render(64).create_view(&Default::default()), wgpu::FilterMode::Linear);
+        device.destroy();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        // the next render arrives after the loss: registered on the lost device
+        let next = renderer.register_native_texture(&device, &render(64).create_view(&Default::default()), wgpu::FilterMode::Linear);
+        let managed = egui::TextureId::Managed(7);
+        let delta = egui::epaint::ImageDelta::full(egui::ColorImage::new([8, 8], vec![egui::Color32::GRAY; 64]), egui::TextureOptions::LINEAR);
+        renderer.update_texture(&device, &queue, managed, &delta);
+        let mut mesh = egui::Mesh::with_texture(next);
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(64.0, 64.0));
+        mesh.add_rect_with_uv(r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+        let shapes = [egui::epaint::ClippedPrimitive { clip_rect: r, primitive: egui::epaint::Primitive::Mesh(mesh) }];
+        let screen = ScreenDescriptor { size_in_pixels: [64, 64], pixels_per_point: 1.0 };
+        // what the app must not draw on a lost device (should egui-wgpu stop panicking here, the
+        // empty frames in `main.rs` can go)
+        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut enc = device.create_command_encoder(&Default::default());
+            renderer.update_buffers(&device, &queue, &mut enc, &shapes, &screen)
+        }));
+        assert!(drawn.is_err(), "egui-wgpu draws on a lost device now");
+        let jobs: [egui::epaint::ClippedPrimitive; 0] = [];
+        let mut enc = device.create_command_encoder(&Default::default());
+        let user = renderer.update_buffers(&device, &queue, &mut enc, &jobs, &screen);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        {
+            let pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
+        }
+        queue.submit(user.into_iter().chain([enc.finish()]));
+        renderer.free_texture(&shown);
+        renderer.free_texture(&next);
+        renderer.free_texture(&managed);
     }
 }
