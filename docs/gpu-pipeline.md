@@ -49,9 +49,9 @@ Overrides (read once at launch):
 - `LIGHTCRAFT_GPU=0`: GPU rendering off for the process (the window is unaffected).
 - Both `LIGHTCRAFT_GPU=0` and `LIGHTCRAFT_GPU_BACKEND=off` also keep AI Denoise, the face models
   and the AI mask model (SAM 3 on Metal) on the CPU.
-- `LIGHTCRAFT_GPU_TEXTURES=0`: renders get a device of their own instead of sharing the window's,
-  and come back as pixels ([Renders as window textures](#renders-as-window-textures-issue-1228));
-  what a restart after a lost device sets.
+- `LIGHTCRAFT_GPU_TEXTURES=1` (opt-in): renders share the window's device and zoom windows come
+  back as textures ([Renders as window textures](#renders-as-window-textures-issue-1228)); a
+  restart after a lost device clears it.
 
 **DX12 shader compiler (issue #471).** Every instance (window and compute) compiles DX12 shaders with
 FXC (`d3dcompiler_47.dll`, part of Windows; `lightcraft_gpu::backend::backend_options`). wgpu's
@@ -249,7 +249,15 @@ real failure still stops the whole process. Such a test asserts on its own rende
 `last_fallback()`, so it can run beside other tests rendering on the GPU (issue #675).
 
 ## Renders as window textures (issue #1228)
-The desktop app lends the window's wgpu device to the renderer (`window_gpu::lend_device` →
+**Opt-in: `LIGHTCRAFT_GPU_TEXTURES=1`.** A device has one queue, and the window's frames wait
+behind the renders on it. In 8 s 1:1 Exposure drags on a 61 MP raw (M4 Max, 4 alternating runs,
+both with one render per view slot) the shared device dropped 0–4 % of frames (p95 12–23 ms,
+worst 33–131 ms) where renders on a device of their own dropped none (p95 8–13 ms, worst
+18–36 ms), against window renders of 4–15 ms instead of 24–50 ms. Pacing the renders'
+submissions (waiting for each piece before queueing the next) made it worse. Until the window's
+frames can go first, renders keep their own device by default.
+
+With it, the desktop app lends the window's wgpu device to the renderer (`window_gpu::lend_device` →
 `lightcraft_gpu::share_window_device`, before anything renders): the kernels compile on it, and the
 window's device is requested with the adapter's limits (`window_device_limits`) so they fit. A
 render that is only drawn — the zoom windows of Detail, Before/After, Compare and Reference
@@ -265,7 +273,7 @@ when it is replaced. A 24 MP raw at 1:1 on an M4 Max: 30 ms per Exposure step in
 Read-back pixels stay for everything else, and are the fallback: the whole frame (its histogram is
 shown), overlays (drawn on the CPU), soft proofs and deep renders, LUT-based display profiles (a
 CMS transform), thumbnails and exports; the glow renderer or a software window adapter (no device
-to share); `LIGHTCRAFT_GPU_TEXTURES=0` (renders keep a device of their own, as before); and any
+to share); without `LIGHTCRAFT_GPU_TEXTURES=1` (renders keep a device of their own); and any
 render that falls back to the CPU. A headless screenshot reads a texture back when it is taken
 (`lightcraft_gpu::read_texture`).
 
@@ -274,7 +282,7 @@ the window. A *lost* device (driver reset, GPU hang) is lost to the window too �
 sharing, when a reset took every device on the GPU. Renders go back to the CPU, and
 `lightcraft_gpu::window_device_lost()` is set: egui-wgpu panics drawing anything on a lost device,
 so the app draws empty frames and asks in a native dialog to restart or quit; after saving, a
-restart starts LightCraft again with `LIGHTCRAFT_GPU_TEXTURES=0`. A loss in the middle of a frame
+restart starts LightCraft again without `LIGHTCRAFT_GPU_TEXTURES`. A loss in the middle of a frame
 (the panic happens before the app can stop drawing) ends `run_native` with an error, and the app
 starts again the same way; the library has written every command to its journal, so only a
 slider drag in progress is lost. Tested by `crates/gpu/tests/texture_lost.rs` and

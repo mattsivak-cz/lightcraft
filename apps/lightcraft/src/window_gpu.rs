@@ -179,9 +179,10 @@ impl lightcraft_ui_egui::render::NativeTextures for WindowTextures {
 /// as textures on it, which [`WindowTextures`] (returned) draws. `None` with the glow renderer,
 /// or when the window's adapter can't run the kernels — renders then keep a device of their own.
 pub fn lend_device(render_state: Option<&eframe::egui_wgpu::RenderState>) -> Option<WindowTextures> {
-    // `LIGHTCRAFT_GPU_TEXTURES=0`: renders keep a device of their own and come back as pixels
-    // (a driver that misbehaves with a shared device; A/B measurements)
-    if std::env::var("LIGHTCRAFT_GPU_TEXTURES").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")) {
+    // Opt-in (`LIGHTCRAFT_GPU_TEXTURES=1`): a window update is fresher, but one device has one
+    // queue, and frames wait behind renders there — a 1:1 slider drag on a 61 MP raw dropped 0–4 %
+    // of its frames, where renders on a device of their own dropped none (issue #1228).
+    if !std::env::var("LIGHTCRAFT_GPU_TEXTURES").is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes")) {
         return None;
     }
     let rs = render_state?;
@@ -235,14 +236,14 @@ pub fn device_lost_answer(ctx: &egui::Context) -> Option<bool> {
 }
 
 /// Start LightCraft again after the window's device was lost, with the arguments it was started
-/// with and renders on a device of their own (`LIGHTCRAFT_GPU_TEXTURES=0`): a driver that loses
-/// shared devices can't take the new window down with a render.
+/// with and renders on a device of their own (`LIGHTCRAFT_GPU_TEXTURES` cleared, so the
+/// default): a driver that loses shared devices can't take the new window down with a render.
 pub fn relaunch_with_own_render_device() -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
     log::warn!("window: starting again, renders on a device of their own");
     std::process::Command::new(exe)
         .args(std::env::args_os().skip(1))
-        .env("LIGHTCRAFT_GPU_TEXTURES", "0")
+        .env_remove("LIGHTCRAFT_GPU_TEXTURES")
         .spawn()
         .map_err(|e| log::error!("window: could not start again: {e}"))
         .is_ok()
