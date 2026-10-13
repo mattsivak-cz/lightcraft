@@ -312,17 +312,21 @@ fn smart_run(
     let stop = AtomicBool::new(false);
     let fatal: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let lanes = lanes.clamp(1, jobs.len().max(1));
-    let queue = std::sync::Mutex::new(jobs.into_iter());
+    // numbered, so failures are reported in job order whichever lane met them
+    let queue = std::sync::Mutex::new(jobs.into_iter().enumerate());
     let lane = || {
         let mut n = SmartCounts::default();
+        let mut failed: Vec<(usize, Value)> = Vec::new();
         loop {
             if stop.load(Ordering::Relaxed) || state.is_some_and(|(st, _)| st.cancel.load(Ordering::Relaxed)) {
                 break;
             }
             let next = queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).next();
-            let Some(job) = next else { break };
+            let Some((index, job)) = next else { break };
             let id = job.0;
-            match crate::guard::catch("building smart previews", || smart_one(dir, discard, job, state, format, &pending, &mut n)) {
+            let r = crate::guard::catch("building smart previews", || smart_one(dir, discard, job, state, format, &pending, &mut n));
+            failed.extend(std::mem::take(&mut n.failed).into_iter().map(|f| (index, f)));
+            match r {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     stop.store(true, Ordering::Relaxed);
@@ -331,7 +335,7 @@ fn smart_run(
                 }
                 Err(e) => {
                     // a panic inside one photo (a hostile file) fails that photo alone
-                    n.failed.push(json!([id.0, e]));
+                    failed.push((index, json!([id.0, e])));
                     if let Some((st, _)) = state {
                         st.failed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -342,23 +346,29 @@ fn smart_run(
                 task.progress(done as u64, st.total as u64);
             }
         }
-        n
+        (n, failed)
     };
     let mut n = SmartCounts::default();
+    let mut failed: Vec<(usize, Value)> = Vec::new();
     std::thread::scope(|sc| {
         // a lane that can't start leaves its photos to the others (and to this thread)
         let others: Vec<_> =
             (1..lanes).map_while(|k| std::thread::Builder::new().name(format!("smart-previews-{k}")).spawn_scoped(sc, lane).ok()).collect();
-        n.add(lane());
+        let mut add = |(c, f): (SmartCounts, Vec<(usize, Value)>)| {
+            n.add(c);
+            failed.extend(f);
+        };
+        add(lane());
         for h in others {
             match h.join() {
-                Ok(c) => n.add(c),
+                Ok(r) => add(r),
                 Err(_) => log::warn!("smart previews: a build lane stopped unexpectedly"),
             }
         }
     });
-    // failures in photo order, whichever lane met them
-    n.failed.sort_by_key(|f| f.get(0).and_then(Value::as_u64));
+    // failures in job order (the order of the selection), as a serial build reports them
+    failed.sort_by_key(|(i, _)| *i);
+    n.failed = failed.into_iter().map(|(_, f)| f).collect();
     // clears the thumbnail cache if a proxy changed, then removes the marker
     drop(pending);
     match fatal.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
@@ -432,8 +442,14 @@ fn smart_one(
             let r = encoded.and_then(|b| {
                 let parent = path.parent().ok_or_else(|| format!("{}: no parent folder", path.display()))?;
                 // Only create the leaf shard: do not recreate a missing external drive.
+                // Another lane may create the same new shard first: that is fine, a missing
+                // parent of the shard still fails.
                 if !parent.is_dir() {
-                    std::fs::create_dir(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+                    match std::fs::create_dir(parent) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && parent.is_dir() => {}
+                        Err(e) => return Err(format!("{}: {e}", parent.display())),
+                    }
                 }
                 lightcraft_catalog::safe_file::write_atomic(&path, &b).map_err(|e| format!("{}: {e}", path.display()))
             });
@@ -509,6 +525,10 @@ fn smart(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let custom = s.smart_previews_dir.is_some();
     let cache = s.media.invalidation();
+    // tests run several lanes on every machine, so #1400's end-to-end tests cover them on small CI runners
+    #[cfg(test)]
+    let lanes = jobs.len().clamp(1, 4);
+    #[cfg(not(test))]
     let lanes = crate::export::export_parallelism(jobs.len());
     if background {
         let what = if discard { "discarding smart previews" } else { "smart previews" };
@@ -870,6 +890,59 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        // Given several lanes writing the first proxies into one new shard folder at once, none of
+        // them fails because another lane created the folder first.
+        #[test]
+        fn lanes_share_a_new_shard_folder() {
+            let s = Session::new();
+            for round in 0..20 {
+                let dir = temp_dir(&format!("shard{round}"));
+                let started = Arc::new(AtomicUsize::new(0));
+                let jobs: Vec<SmartJob> = (1..=8u64)
+                    .map(|i| {
+                        let started = started.clone();
+                        job(&dir, &format!("ab{i:02}"), i, move || {
+                            // the first four line up, so their writes meet the missing shard together
+                            started.fetch_add(1, Ordering::SeqCst);
+                            let t = Instant::now();
+                            while started.load(Ordering::SeqCst) < 4 && t.elapsed() < Duration::from_secs(5) {
+                                std::hint::spin_loop();
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                let n = smart_run(&dir, false, false, jobs, None, None, &s.media.invalidation(), 4).unwrap();
+                assert!(n.failed.is_empty(), "round {round}: {:?}", n.failed);
+                assert_eq!(n.built, 8);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        // Given failures met by different lanes out of order, they are reported in job order (the
+        // selection's order, not photo id order), as the serial build reported them.
+        #[test]
+        fn failures_are_reported_in_job_order() {
+            let s = Session::new();
+            let dir = temp_dir("order");
+            let ids = [9u64, 7, 5, 3, 1];
+            let jobs: Vec<SmartJob> = ids
+                .iter()
+                .enumerate()
+                .map(|(k, &id)| {
+                    job(&dir, &format!("f{id}0{id}"), id, move || {
+                        // earlier jobs finish later
+                        std::thread::sleep(Duration::from_millis(10 * (ids.len() - k) as u64));
+                        Err("unreadable".to_string())
+                    })
+                })
+                .collect();
+            let n = smart_run(&dir, false, false, jobs, None, None, &s.media.invalidation(), 3).unwrap();
+            let got: Vec<u64> = n.failed.iter().filter_map(|f| f[0].as_u64()).collect();
+            assert_eq!(got, ids);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         // Given a cancel during a build with several lanes, every lane stops and each proxy on disk is complete.
         #[test]
         fn cancel_stops_every_lane_and_leaves_no_partial_proxy() {
@@ -891,8 +964,11 @@ mod tests {
                 .collect();
             let task = task_for(&s, &state);
             let n = smart_run(&dir, false, false, jobs, Some((&state, &task)), None, &s.media.invalidation(), 4).unwrap();
-            assert!(n.built < 40, "stopped early: {}", n.built);
+            // job 3 cancels: the four first jobs, plus at most one more per lane already in flight
+            assert!(n.built <= 4 + 4, "stopped early: {}", n.built);
+            assert_eq!(state.done.load(Ordering::Relaxed), n.built, "no photo counted twice or lost across lanes");
             for e in walk(&dir) {
+                assert!(e.extension().is_some_and(|x| x == "lcsp"), "{} is left behind", e.display());
                 assert!(crate::smart::is_usable(&e), "{} is complete", e.display());
             }
             let _ = std::fs::remove_dir_all(&dir);
@@ -902,11 +978,7 @@ mod tests {
             let mut out = Vec::new();
             for e in std::fs::read_dir(dir).unwrap().flatten() {
                 let p = e.path();
-                if p.is_dir() {
-                    out.extend(walk(&p))
-                } else if p.extension().is_some_and(|x| x == "lcsp") {
-                    out.push(p)
-                }
+                if p.is_dir() { out.extend(walk(&p)) } else { out.push(p) }
             }
             out
         }
