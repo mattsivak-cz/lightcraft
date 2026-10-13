@@ -304,6 +304,7 @@ pub fn window_device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
 /// own, as the render device asks for. A GL adapter keeps egui's WebGL2 limits with its 8192 px
 /// texture side for 4k+ displays (the kernels never run there). Never above `adapter`: a device
 /// asked for more than the adapter has isn't created, and the window doesn't open.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn window_limits(backend: wgpu::Backend, adapter: wgpu::Limits) -> wgpu::Limits {
     if backend == wgpu::Backend::Gl {
         let side = adapter.max_texture_dimension_2d.min(8192);
@@ -753,6 +754,7 @@ mod tests {
     // The window device never asks for more than the adapter has: an adapter with a 4096 px
     // texture side (older or mobile GPUs, software adapters) would refuse 8192, and the window
     // wouldn't open; a larger side is the adapter's own
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn the_window_device_never_asks_above_the_adapter() {
         let adapter = |side| wgpu::Limits { max_texture_dimension_2d: side, ..wgpu::Limits::downlevel_defaults() };
