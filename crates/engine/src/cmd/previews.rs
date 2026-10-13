@@ -423,13 +423,17 @@ fn smart_one(
             // atomic: a failed write leaves no partial proxy that would pass for a built one;
             // and synced (issue #134): built so the photo can be edited while its original
             // is offline, when it is the only copy — the sync is small next to the decode
-            let loaded = source.ok_or_else(|| "nothing to build from".to_string()).and_then(|s| s.load_source());
+            // A decoder or encoder that panics on a hostile file fails this proxy through the
+            // error paths below (a stale one is kept and counted), not as a lane-level failure.
+            let loaded = source
+                .ok_or_else(|| "nothing to build from".to_string())
+                .and_then(|s| crate::guard::catch("decoding a smart preview's original", || s.load_source()).and_then(|r| r));
             let unavailable = loaded.is_err();
             let encoded = loaded
                 .and_then(|src| {
                     // the decoder facts ride with the pixels, so an offline edit renders as online
                     let info = src.info_or(Default::default());
-                    crate::smart::encode_format(&src.image, Some(&info), storage)
+                    crate::guard::catch("encoding a smart preview", || crate::smart::encode_format(&src.image, Some(&info), storage)).and_then(|r| r)
                 })
                 .and_then(|bytes| match &previous {
                     Some((_, head)) => crate::smart::preserve_header(&bytes, head),
@@ -493,26 +497,12 @@ fn smart_one(
     Ok(())
 }
 
-/// Tests: build smart previews with this many lanes whatever the machine. 0 (the default) means up
-/// to four, one per photo. Process-wide: set it only to a count that leaves every other test's
-/// build as it was (4 does), never reset it.
-#[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) static SMART_LANES_FOR_TESTS: AtomicUsize = AtomicUsize::new(0);
-
 /// How many proxies Build Smart Previews builds side by side for `n` photos: as many as an export
 /// batch. Tests run several lanes on every machine, so #1400's end-to-end tests cover them on small
 /// CI runners too.
 #[cfg(not(target_arch = "wasm32"))]
 fn smart_lanes(n: usize) -> usize {
-    #[cfg(test)]
-    {
-        match SMART_LANES_FOR_TESTS.load(Ordering::Relaxed) {
-            0 => n.clamp(1, 4),
-            l => l,
-        }
-    }
-    #[cfg(not(test))]
-    crate::export::export_parallelism(n)
+    if cfg!(test) { n.clamp(1, 4) } else { crate::export::export_parallelism(n) }
 }
 
 /// Smart previews: build (from the original, at preview size) or discard the proxies that keep
@@ -905,6 +895,27 @@ mod tests {
             assert_eq!(n.failed[0][0], 99);
             assert_eq!(state.done.load(Ordering::Relaxed), 6, "progress reaches the total");
             assert_eq!(state.failed.load(Ordering::Relaxed), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Given a usable proxy due for conversion whose original's decoder panics, the proxy is kept
+        // and counted like one whose original is offline, not reported as a failed photo.
+        #[test]
+        fn a_stale_proxy_whose_decoder_panics_is_kept() {
+            let s = Session::new();
+            let dir = temp_dir("stalepanic");
+            let n = smart_run(&dir, false, false, vec![job(&dir, "fa01", 1, || Ok(()))], None, None, &s.media.invalidation(), 1).unwrap();
+            assert_eq!(n.built, 1);
+            let proxy = dir.join("fa").join("fa01.lcsp");
+            let before = std::fs::read(&proxy).unwrap();
+            let state = PreviewBuild { total: 1, what: "smart previews", ..Default::default() };
+            let task = task_for(&s, &state);
+            let jobs = vec![job(&dir, "fa01", 1, || panic!("hostile raw"))];
+            let n =
+                smart_run(&dir, false, false, jobs, Some((&state, &task)), Some(crate::smart::Format::Lossless), &s.media.invalidation(), 2).unwrap();
+            assert_eq!((n.built, n.stale_kept, n.failed.len()), (1, 1, 0), "{:?}", n.failed);
+            assert_eq!(state.kept.load(Ordering::Relaxed), 1);
+            assert_eq!(std::fs::read(&proxy).unwrap(), before, "the proxy is left as it was");
             let _ = std::fs::remove_dir_all(&dir);
         }
 

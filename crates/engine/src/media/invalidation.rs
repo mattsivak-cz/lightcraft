@@ -78,7 +78,7 @@ impl Invalidation {
 
     /// The thumbnail changes of one proxy run (see [`Pending`]).
     pub(crate) fn pending(&self) -> Pending {
-        Pending { invalidation: self.clone(), marker: None, recorded: false, unrecorded: false, changed: false }
+        Pending { invalidation: self.clone(), marker: None, recorded: false, unrecorded: false, changed: false, refused: None }
     }
 }
 
@@ -107,6 +107,9 @@ pub(crate) struct Pending {
     /// The drive was full: no marker, so every replacement is followed by a clear.
     unrecorded: bool,
     changed: bool,
+    /// Why recording failed, kept so every later call in the run (another lane's) is refused too:
+    /// a retry that happens to succeed must not write while the run reports the failure.
+    refused: Option<String>,
 }
 
 impl Pending {
@@ -126,6 +129,9 @@ impl Pending {
         if self.recorded {
             return Ok(());
         }
+        if let Some(e) = &self.refused {
+            return Err(e.clone());
+        }
         let dir = self.invalidation.0.lock().unwrap_or_else(PoisonError::into_inner).cache.disk().map(|disk| disk.dir().to_path_buf());
         // (a memory-only cache does not outlive the process)
         if let Some(dir) = dir {
@@ -143,7 +149,11 @@ impl Pending {
                     }
                 }
                 Err(e) if change == Change::Remove => log::warn!("thumbnail cache: {}: {e}; discarding without a marker", dir.display()),
-                Err(e) => return Err(format!("could not record the thumbnail cache change in {}: {e}", dir.display())),
+                Err(e) => {
+                    let e = format!("could not record the thumbnail cache change in {}: {e}", dir.display());
+                    self.refused = Some(e.clone());
+                    return Err(e);
+                }
             }
         }
         self.recorded = true;

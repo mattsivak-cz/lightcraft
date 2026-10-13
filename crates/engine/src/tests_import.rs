@@ -829,9 +829,7 @@ fn damaged_smart_previews_are_rebuilt_and_failed_writes_leave_none() {
 /// the only one repaired, inline and in the app's background build.
 #[test]
 fn smart_previews_build_with_four_lanes_counts_each_once() {
-    // process-wide: every other test's build already runs min(photos, 4) lanes, and smart_run caps
-    // the lanes at the photo count, so 4 changes no one else's run
-    crate::cmd::previews::SMART_LANES_FOR_TESTS.store(4, std::sync::atomic::Ordering::Relaxed);
+    // tests build with up to four lanes on any machine (`smart_lanes`), so six photos use four
     let src = temp_dir("smart4-src");
     let lib = temp_dir("smart4-lib");
     let paths: Vec<String> = (0..6u8)
