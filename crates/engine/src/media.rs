@@ -25,7 +25,7 @@ use lightcraft_pipeline::{Quality, RenderRequest, Rendered, SourceInfo, StageCac
 #[cfg(not(target_arch = "wasm32"))]
 mod invalidation;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use invalidation::{Change, Invalidation, interrupted_runs};
+pub(crate) use invalidation::{Change, Invalidation, Pending, interrupted_runs};
 
 use lightcraft_preview::{Hash128, Hasher128, Lru, PreviewCache};
 use lightcraft_raster::{Histogram, Rgb32f, Rgba8};
