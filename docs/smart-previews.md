@@ -8,6 +8,8 @@ Settings > Performance > Smart previews has a per-library format preference. Com
 
 File > Previews > Build Smart Previews offers the library format or a format for that build. A build override does not change the library preference. Settings also has Build for All Photos. Before a Lossless build starts, a dialog shows the photo count, estimated total size and free space on the destination volume. The estimate uses about 39.5 MB per photo from the measured A7CR proxy; actual sizes vary. If the estimate exceeds free space, the dialog warns and offers Build Anyway or Cancel. Builds run in the background, report progress, and can be stopped.
 
+Build Smart Previews builds several photos at once: one lane per four cores, up to four, as many as an export batch (issue #1492). The opening look refresh uses one lane, so it does not slow the first renders. Copies of a photo share one proxy, which is written once. On a 16-core Apple M4 Max (four lanes), 24 corpus raws took 2.6 s instead of 5.8 s in Compact and 3.1 s instead of 8.3 s in Lossless. Peak memory rose from about 1.0 GB to about 2.0 GB (Compact) and 1.1 GB to 1.9 GB (Lossless). Two lanes took 3.7 s and 4.7 s.
+
 Changing the preference does not rewrite files. A subsequent build converts existing previews from available originals. If an original is offline or unreadable, its existing preview stays unchanged. Reconnect the drive and build again to convert it. Converting a JPEG proxy cannot restore precision, so builds never use an old proxy as their source.
 
 The displayed count and total size use the actual files in both the old flat layout and the current sharded layout. Mixed-format libraries are supported.
