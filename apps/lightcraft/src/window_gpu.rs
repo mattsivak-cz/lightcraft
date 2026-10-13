@@ -149,14 +149,28 @@ pub fn base_options() -> WgpuConfiguration {
         n.instance_descriptor.backend_options = backend::backend_options();
         // no indirect-call validation pipeline: Intel Metal fails to compile it and the window never opens (#250)
         n.instance_descriptor.flags = backend::instance_flags_from_env(n.instance_descriptor.flags);
-        // the adapter's limits, so renders can share the device and hand the window textures (#1228)
-        n.device_descriptor = std::sync::Arc::new(|adapter| wgpu::DeviceDescriptor {
-            label: Some("egui wgpu device"),
-            required_limits: lightcraft_engine::gpu::window_device_limits(adapter),
-            ..Default::default()
-        });
+        n.device_descriptor = std::sync::Arc::new(device_descriptor);
     }
     c
+}
+
+/// Whether renders may share the window's device and reach it as textures (issue #1228): opt-in,
+/// `LIGHTCRAFT_GPU_TEXTURES=1`.
+fn gpu_textures_on() -> bool {
+    std::env::var("LIGHTCRAFT_GPU_TEXTURES").is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes"))
+}
+
+/// The window's device: egui's own, unless renders may share it ([`gpu_textures_on`]); then the
+/// adapter's limits (never above them), so renders can run there and hand the window textures.
+fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    if !gpu_textures_on() {
+        return (eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle().device_descriptor)(adapter);
+    }
+    wgpu::DeviceDescriptor {
+        label: Some("egui wgpu device"),
+        required_limits: lightcraft_engine::gpu::window_device_limits(adapter),
+        ..Default::default()
+    }
 }
 
 /// Renders that stay on the GPU (issue #1228), drawn through the window's egui-wgpu renderer: they
@@ -182,7 +196,7 @@ pub fn lend_device(render_state: Option<&eframe::egui_wgpu::RenderState>) -> Opt
     // Opt-in (`LIGHTCRAFT_GPU_TEXTURES=1`): a window update is fresher, but one device has one
     // queue, and frames wait behind renders there — a 1:1 slider drag on a 61 MP raw dropped 0–4 %
     // of its frames, where renders on a device of their own dropped none (issue #1228).
-    if !std::env::var("LIGHTCRAFT_GPU_TEXTURES").is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes")) {
+    if !gpu_textures_on() {
         return None;
     }
     let rs = render_state?;
@@ -283,13 +297,9 @@ fn probe(backends: Backends) -> Result<WgpuSetupExisting, String> {
         ..Default::default()
     }))
     .map_err(|e| format!("no adapter: {e}"))?;
-    // (as `base_options` asks: renders can share the device)
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("egui wgpu device"),
-        required_limits: lightcraft_engine::gpu::window_device_limits(&adapter),
-        ..Default::default()
-    }))
-    .map_err(|e| format!("{}: no device: {e}", adapter.get_info().name))?;
+    // (as `base_options` asks)
+    let (device, queue) = pollster::block_on(adapter.request_device(&device_descriptor(&adapter)))
+        .map_err(|e| format!("{}: no device: {e}", adapter.get_info().name))?;
     install_error_handler(&device);
     check_pipeline(&device, |d| {
         drop(eframe::egui_wgpu::Renderer::new(d, wgpu::TextureFormat::Bgra8Unorm, eframe::egui_wgpu::RendererOptions::default()));
@@ -478,8 +488,10 @@ mod tests {
         mesh.add_rect_with_uv(r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         let shapes = [egui::epaint::ClippedPrimitive { clip_rect: r, primitive: egui::epaint::Primitive::Mesh(mesh) }];
         let screen = ScreenDescriptor { size_in_pixels: [64, 64], pixels_per_point: 1.0 };
-        // what the app must not draw on a lost device (should egui-wgpu stop panicking here, the
-        // empty frames in `main.rs` can go)
+        // what the app must not draw on a lost device. This pins an egui-wgpu bug: the day an
+        // egui-wgpu update stops panicking here, this assertion fails. Then delete it and this
+        // half of the test, and draw frames on a lost device as usual (the empty frames in
+        // `main.rs` can go); the empty frame below must still not panic.
         let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut enc = device.create_command_encoder(&Default::default());
             renderer.update_buffers(&device, &queue, &mut enc, &shapes, &screen)

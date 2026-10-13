@@ -294,16 +294,22 @@ pub fn share_window_device(device: wgpu::Device, queue: wgpu::Queue, info: wgpu:
 }
 
 /// The limits to request the window's device with so renders can share it
-/// ([`share_window_device`]): the adapter's own, as the render device asks for, with at least the
-/// 8192 px texture side egui needs for 4k+ displays. A GL adapter keeps egui's WebGL2 limits (the
-/// kernels never run there).
+/// ([`share_window_device`]): [`window_limits`] for this adapter.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn window_device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
-    if adapter.get_info().backend == wgpu::Backend::Gl {
-        return wgpu::Limits { max_texture_dimension_2d: 8192, ..wgpu::Limits::downlevel_webgl2_defaults() };
+    window_limits(adapter.get_info().backend, adapter.limits())
+}
+
+/// The window device's limits on an adapter of `backend` that supports `adapter`: the adapter's
+/// own, as the render device asks for. A GL adapter keeps egui's WebGL2 limits with its 8192 px
+/// texture side for 4k+ displays (the kernels never run there). Never above `adapter`: a device
+/// asked for more than the adapter has isn't created, and the window doesn't open.
+pub fn window_limits(backend: wgpu::Backend, adapter: wgpu::Limits) -> wgpu::Limits {
+    if backend == wgpu::Backend::Gl {
+        let side = adapter.max_texture_dimension_2d.min(8192);
+        return wgpu::Limits { max_texture_dimension_2d: side, ..wgpu::Limits::downlevel_webgl2_defaults() };
     }
-    let limits = adapter.limits();
-    wgpu::Limits { max_texture_dimension_2d: limits.max_texture_dimension_2d.max(8192), ..limits }
+    adapter
 }
 
 /// Set when the device lent by [`share_window_device`] was lost (driver reset, GPU hang).
@@ -742,5 +748,19 @@ mod tests {
         assert!(!super::handles(OutputDepth::U16, false, Overlay::None));
         assert!(!super::handles(OutputDepth::U8, true, Overlay::None));
         assert!(!super::handles(OutputDepth::U8, false, Overlay::HdrRange));
+    }
+
+    // The window device never asks for more than the adapter has: an adapter with a 4096 px
+    // texture side (older or mobile GPUs, software adapters) would refuse 8192, and the window
+    // wouldn't open; a larger side is the adapter's own
+    #[test]
+    fn the_window_device_never_asks_above_the_adapter() {
+        let adapter = |side| wgpu::Limits { max_texture_dimension_2d: side, ..wgpu::Limits::downlevel_defaults() };
+        for backend in [wgpu::Backend::Metal, wgpu::Backend::Vulkan, wgpu::Backend::Dx12, wgpu::Backend::Gl] {
+            assert_eq!(super::window_limits(backend, adapter(4096)).max_texture_dimension_2d, 4096, "{backend:?}");
+        }
+        assert_eq!(super::window_limits(wgpu::Backend::Metal, adapter(16384)).max_texture_dimension_2d, 16384);
+        assert_eq!(super::window_limits(wgpu::Backend::Gl, adapter(16384)).max_texture_dimension_2d, 8192);
+        assert_eq!(super::window_limits(wgpu::Backend::Vulkan, adapter(4096)), adapter(4096));
     }
 }
