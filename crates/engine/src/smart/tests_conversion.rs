@@ -6,7 +6,7 @@ use crate::{Session, media};
 use lightcraft_catalog::{PhotoId, Source};
 use lightcraft_preview::{Hash128, PreviewCache};
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 const EXIT_CODE: i32 = 82;
 
@@ -130,6 +130,22 @@ fn loose_files(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// `name`'s proxy in `s`'s smart previews folder.
+fn proxy_of(s: &Session, name: &str) -> PathBuf {
+    file_path(s.media.smart_dir.as_ref().unwrap(), s.catalog.photo(photo_id(s, name)).unwrap())
+}
+
+/// Waits (up to 10 s) until `proxy` is written as Lossless. A build runs several photos at once
+/// (issue #1492), so a later photo's original can be read before an earlier one's proxy is written;
+/// a hook that stands for "after that proxy converted" waits for it here.
+fn wait_converted(proxy: &Path) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !matches!(header(proxy), Some((Format::Lossless, _))) {
+        assert!(std::time::Instant::now() < until, "{} was never converted", proxy.display());
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 #[ignore = "child process for the interrupted conversion regression"]
 fn interrupted_conversion_child() {
@@ -137,14 +153,13 @@ fn interrupted_conversion_child() {
     let mut s = Session::new().with_fs();
     s.open_library(root.join("library"), false).unwrap();
     let loader = s.media.file_loader.clone().unwrap();
-    let first_read = AtomicBool::new(false);
+    let first = proxy_of(&s, "first.tif");
     s.media.file_loader = Some(Arc::new(move |path, edge| {
         if path.ends_with("second.tif") {
             // The first photo's Lossless proxy is durable; the build's final clear has not run.
-            assert!(first_read.load(Ordering::SeqCst), "the first photo converts first");
+            wait_converted(&first);
             std::process::exit(EXIT_CODE);
         }
-        first_read.store(true, Ordering::SeqCst);
         loader(path, edge)
     }));
     let ids = ids(&s);
@@ -218,8 +233,10 @@ fn reopening_during_a_running_build_keeps_its_marker() {
     let (release, blocked) = mpsc::channel::<()>();
     let blocked = Mutex::new(blocked);
     let loader = s.media.file_loader.clone().unwrap();
+    let first = proxy_of(&s, "first.tif");
     s.media.file_loader = Some(Arc::new(move |path, edge| {
         if path.ends_with("second.tif") {
+            wait_converted(&first);
             entered.send(()).unwrap();
             blocked.lock().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
         }
@@ -256,8 +273,10 @@ fn block_second(s: &mut Session) -> (std::sync::mpsc::Receiver<()>, std::sync::m
     let (release, blocked) = mpsc::channel::<()>();
     let blocked = Mutex::new(blocked);
     let loader = s.media.file_loader.clone().unwrap();
+    let first = proxy_of(s, "first.tif");
     s.media.file_loader = Some(Arc::new(move |path, edge| {
         if path.ends_with("second.tif") {
+            wait_converted(&first);
             entered.send(()).unwrap();
             blocked.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         }
@@ -360,8 +379,10 @@ fn failed_preferences_child() {
     set_online(&root, true);
     // A conversion replaces the first proxy, then the process ends while reading the second original.
     let loader = s.media.file_loader.clone().unwrap();
+    let first = proxy_of(&s, "first.tif");
     s.media.file_loader = Some(Arc::new(move |path, edge| {
         if path.ends_with("second.tif") {
+            wait_converted(&first);
             std::process::exit(EXIT_CODE);
         }
         loader(path, edge)
@@ -630,8 +651,10 @@ fn interrupted_discard_then_build_child() {
     if std::env::var("LC_SMART_CHAIN_MODE").unwrap() == "build" {
         // A first build writes the first proxy, then the process ends while reading the second original.
         let loader = s.media.file_loader.clone().unwrap();
+        let first = proxy_of(&s, "first.tif");
         s.media.file_loader = Some(Arc::new(move |path, edge| {
             if path.ends_with("second.tif") {
+                wait_converted(&first);
                 std::process::exit(EXIT_CODE);
             }
             loader(path, edge)
@@ -711,11 +734,26 @@ fn full_drive_fallback_child() {
     let (release, blocked) = mpsc::channel::<()>();
     let blocked = Mutex::new(blocked);
     let loader = s.media.file_loader.clone().unwrap();
+    // The build runs several photos at once (issue #1492): each hook waits until the photos ahead
+    // of it are done, the clear after each replacement included.
+    let build: Arc<Mutex<Option<Arc<crate::cmd::previews::PreviewBuild>>>> = Arc::default();
+    let done = {
+        let build = build.clone();
+        move |n: usize| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while build.lock().unwrap().as_ref().is_none_or(|b| b.done.load(Ordering::SeqCst) < n) {
+                assert!(std::time::Instant::now() < until, "the photos ahead never finished");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    };
     s.media.file_loader = Some(Arc::new(move |path, edge| {
         if path.ends_with("third.tif") {
+            done(2);
             std::process::exit(EXIT_CODE);
         }
         if path.ends_with("second.tif") {
+            done(1);
             entered.send(()).unwrap();
             blocked.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         }
@@ -723,6 +761,7 @@ fn full_drive_fallback_child() {
     }));
     let ids = [photo_id(&s, "first.tif").0, photo_id(&s, "second.tif").0, photo_id(&s, "third.tif").0];
     s.execute("library.smartPreviews", &json!({"format": "lossless", "ids": ids, "background": true})).unwrap();
+    *build.lock().unwrap() = s.preview_build.clone();
     waiting.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     // The first proxy is replaced. The grid shows the second photo from its old proxy, as when
     // its drive still reads as offline, and that thumbnail is written to disk.
