@@ -479,6 +479,28 @@ fn smart_one(
     Ok(())
 }
 
+/// Tests: build smart previews with this many lanes whatever the machine. 0 (the default) means up
+/// to four, one per photo. Process-wide: set it only to a count that leaves every other test's
+/// build as it was (4 does), never reset it.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) static SMART_LANES_FOR_TESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many proxies Build Smart Previews builds side by side for `n` photos: as many as an export
+/// batch. Tests run several lanes on every machine, so #1400's end-to-end tests cover them on small
+/// CI runners too.
+#[cfg(not(target_arch = "wasm32"))]
+fn smart_lanes(n: usize) -> usize {
+    #[cfg(test)]
+    {
+        match SMART_LANES_FOR_TESTS.load(Ordering::Relaxed) {
+            0 => n.clamp(1, 4),
+            l => l,
+        }
+    }
+    #[cfg(not(test))]
+    crate::export::export_parallelism(n)
+}
+
 /// Smart previews: build (from the original, at preview size) or discard the proxies that keep
 /// photos editable while their originals are offline. With `background` (the app) the files are
 /// read and written on a worker thread; progress like Build Previews (`library.previewProgress`).
@@ -511,11 +533,7 @@ fn smart(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let custom = s.smart_previews_dir.is_some();
     let cache = s.media.invalidation();
-    // tests run several lanes on every machine, so #1400's end-to-end tests cover them on small CI runners
-    #[cfg(test)]
-    let lanes = jobs.len().clamp(1, 4);
-    #[cfg(not(test))]
-    let lanes = crate::export::export_parallelism(jobs.len());
+    let lanes = smart_lanes(jobs.len());
     if background {
         let what = if discard { "discarding smart previews" } else { "smart previews" };
         let state = Arc::new(PreviewBuild { total: jobs.len(), what, ..Default::default() });
