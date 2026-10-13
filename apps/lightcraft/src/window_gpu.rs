@@ -229,8 +229,7 @@ pub fn device_lost_answer(ctx: &egui::Context) -> Option<bool> {
     }
     *answer = Some(None);
     let ctx = ctx.clone();
-    let asked = std::thread::Builder::new().name("device-lost".into()).spawn(move || {
-        let (title, text, restart, quit) = lightcraft_ui_egui::i18n::device_lost_message();
+    let asked = ask_device_lost(move |(title, text, restart, quit)| {
         let r = rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
             .set_title(title)
@@ -247,6 +246,13 @@ pub fn device_lost_answer(ctx: &egui::Context) -> Option<bool> {
         return Some(true);
     }
     None
+}
+
+/// Shows the lost-device dialog (`ask`) on a thread of its own. The message is put together
+/// here, on the calling (UI) thread: the UI language is per thread, and a new thread's is English.
+fn ask_device_lost(ask: impl FnOnce((String, String, String, String)) + Send + 'static) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let message = lightcraft_ui_egui::i18n::device_lost_message();
+    std::thread::Builder::new().name("device-lost".into()).spawn(move || ask(message))
 }
 
 /// Start LightCraft again after the window's device was lost, with the arguments it was started
@@ -352,6 +358,20 @@ pub fn relaunch_after_failure(files: &Files) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The lost-device dialog runs on a thread of its own, whose UI language would be English:
+    /// its text must be in the language the UI thread has.
+    #[test]
+    fn the_lost_device_dialog_speaks_the_ui_language() {
+        use lightcraft_ui_egui::i18n;
+        let other = *i18n::Locale::ALL.iter().find(|&&l| l != i18n::Locale::En).unwrap();
+        i18n::set_language(other);
+        let expected = i18n::device_lost_message();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ask_device_lost(move |message| tx.send(message).unwrap()).unwrap().join().unwrap();
+        i18n::set_language(i18n::Locale::En);
+        assert_eq!(rx.recv().unwrap(), expected, "dialog shown in {other:?}");
+    }
 
     fn dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("app-window-gpu-{tag}-{}", std::process::id()));
