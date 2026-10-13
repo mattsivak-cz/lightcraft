@@ -824,6 +824,79 @@ fn damaged_smart_previews_are_rebuilt_and_failed_writes_leave_none() {
     let _ = std::fs::remove_dir_all(&lib);
 }
 
+/// Issue #1492: Build Smart Previews runs several lanes. With four lanes on any machine, six photos
+/// are each built, counted and shown in progress exactly once, and a damaged proxy among them is
+/// the only one repaired, inline and in the app's background build.
+#[test]
+fn smart_previews_build_with_four_lanes_counts_each_once() {
+    // process-wide: every other test's build already runs min(photos, 4) lanes, and smart_run caps
+    // the lanes at the photo count, so 4 changes no one else's run
+    crate::cmd::previews::SMART_LANES_FOR_TESTS.store(4, std::sync::atomic::Ordering::Relaxed);
+    let src = temp_dir("smart4-src");
+    let lib = temp_dir("smart4-lib");
+    let paths: Vec<String> = (0..6u8)
+        .map(|i| {
+            let p = src.join(format!("p{i}.png"));
+            write_png(&p, i * 40 + 1);
+            p.to_string_lossy().into_owned()
+        })
+        .collect();
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    s.execute("library.import", &json!({"paths": paths})).unwrap();
+    let all: Vec<u64> = s.catalog.photos().map(|p| p.id.0).collect();
+    assert_eq!(all.len(), 6);
+    let dir = s.media.smart_dir.clone().unwrap();
+    let files: Vec<std::path::PathBuf> =
+        all.iter().map(|&i| crate::smart::sharded_file_path(&dir, s.catalog.photo(lightcraft_catalog::PhotoId(i)).unwrap())).collect();
+    let mut distinct = files.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 6, "six different proxies");
+    let counts = |r: &Value| ["built", "repaired", "refreshed", "staleKept", "removed"].map(|k| r[k].as_u64());
+
+    let r = s.execute("library.smartPreviews", &json!({"ids": all})).unwrap();
+    assert_eq!(counts(&r), [Some(6), Some(0), Some(0), Some(0), Some(0)], "{r}");
+    assert_eq!(ids(&r, "failed"), 0, "{r}");
+    assert_eq!(crate::smart::stats(&dir).0, 6, "one proxy per photo");
+    assert!(files.iter().all(|f| crate::smart::is_complete(f)));
+    let full: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+
+    // all there: a second build writes nothing and counts each once
+    let r = s.execute("library.smartPreviews", &json!({"ids": all})).unwrap();
+    assert_eq!(counts(&r), [Some(6), Some(0), Some(0), Some(0), Some(0)], "{r}");
+
+    // one cut short: only it is repaired
+    let victim = &files[3];
+    std::fs::write(victim, &full[3][..full[3].len() / 2]).unwrap();
+    let r = s.execute("library.smartPreviews", &json!({"ids": all})).unwrap();
+    assert_eq!(counts(&r), [Some(6), Some(1), Some(0), Some(0), Some(0)], "{r}");
+    assert_eq!(std::fs::read(victim).unwrap(), full[3], "rebuilt whole");
+
+    // the app's background build: progress reaches the total once, not once per lane
+    std::fs::write(victim, &full[3][..full[3].len() / 2]).unwrap();
+    s.execute("library.smartPreviews", &json!({"ids": all, "background": true})).unwrap();
+    let t0 = std::time::Instant::now();
+    let r = loop {
+        let r = s.execute("library.previewProgress", &json!({})).unwrap();
+        if r["running"] == false || t0.elapsed() > std::time::Duration::from_secs(60) {
+            break r;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let progress = ["total", "done", "failed", "repaired"].map(|k| r[k].as_u64());
+    assert_eq!(progress, [Some(6), Some(6), Some(0), Some(1)], "{r}");
+    assert_eq!(std::fs::read(victim).unwrap(), full[3], "rebuilt whole in the background");
+    assert_eq!(crate::smart::stats(&dir).0, 6);
+
+    // discarding with several lanes removes each one once
+    let r = s.execute("library.smartPreviews", &json!({"ids": all, "discard": true})).unwrap();
+    assert_eq!(r["removed"].as_u64(), Some(6), "{r}");
+    assert_eq!(crate::smart::stats(&dir).0, 0);
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
 /// LUT profiles: a .cube imports as a creative profile (into the library), renders differently
 /// (Amount 0 = no change), is listed in the profile browser and comes back with the library.
 #[test]
