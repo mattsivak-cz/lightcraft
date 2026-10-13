@@ -640,6 +640,24 @@ fn a_conversion_refused_for_a_permission_error_keeps_the_thumbnail_cache() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// Issue #1492: with one lane per photo, a marker refused once refuses the whole run. Another lane's
+/// retry would succeed, and must not convert its proxy while the run reports the failure.
+#[test]
+fn a_marker_refused_once_converts_no_proxy_on_any_lane() {
+    let root = fixture("conversion-refused-once");
+    fail_markers(&root, std::io::ErrorKind::PermissionDenied, 1);
+    let mut s = Session::new().with_fs();
+    s.open_library(root.join("library"), false).unwrap();
+    let ids = ids(&s);
+    assert!(s.execute("library.smartPreviews", &json!({"format": "lossless", "ids": ids})).is_err());
+    for id in ids {
+        let photo = s.catalog.photo(PhotoId(id)).unwrap();
+        assert_eq!(header(&file_path(s.media.smart_dir.as_ref().unwrap(), photo)).unwrap().0, Format::Compact);
+    }
+    drop(s);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Child modes for the interrupted discard, then interrupted first build, regression.
 #[test]
 #[ignore = "child process for the interrupted discard and build regression"]
