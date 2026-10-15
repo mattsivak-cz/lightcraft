@@ -160,3 +160,81 @@ fn focus_stack_keeps_the_texture() {
     assert!(corner.iter().all(|e| *e < 0.15), "alignment corner error {corner:?} px");
     assert!(gains.iter().all(|g| *g > 0.95), "texture kept {gains:?}");
 }
+
+/// Halos: a textured disc near the camera in front of a textured background far away, 5 frames
+/// focused from the disc (frame 0) to the background (frame 4); defocus as blurred layers (the disc's
+/// matte blurred with it, so a background-focused frame shows the disc's blur spilling over the
+/// background). Measured around the disc's edge: the low-frequency error against the all-sharp scene (a
+/// halo) and the texture kept. Measured 0.0025 and 88 % (100 % away from the edge). Two alternatives measured worse
+/// and weren't kept: one sharpness map per frame used for every band (a depth map: 0.0063, 84 %, and 1.7× slower),
+/// and the activity window at σ = 2 or 5 instead of 3 (within noise).
+#[test]
+fn focus_stack_edge_halo() {
+    use lightcraft_raster::Plane;
+    use lightcraft_raster::blur::gaussian;
+    const HW: usize = 1600;
+    const HH: usize = 1000;
+    const HN: usize = 5;
+    const HSIGMA: f64 = 8.0;
+    let w = waves();
+    let (cx, cy, rad) = (800.0, 500.0, 300.0);
+    let matte = Plane::from_fn(HW, HH, |x, y| {
+        let d = ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt();
+        (rad + 0.5 - d).clamp(0.0, 1.0) as f32
+    });
+    // the disc's texture: the same waves turned and brighter
+    let fg = |x: f64, y: f64, s: f64| scene(y * 1.3 + 77.0, x * 1.3 + 31.0, s, &w) * 1.6;
+    let bg = |x: f64, y: f64, s: f64| scene(x, y, s, &w);
+    let shot = |sf: f64, sb: f64, noise: Option<u64>| {
+        let m = if sf > 0.0 { gaussian(&matte, sf as f32) } else { matte.clone() };
+        let mut img = Rgb32f::from_fn(HW, HH, |x, y| {
+            let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+            let a = m.get(x, y);
+            [a * fg(px, py, sf) + (1.0 - a) * bg(px, py, sb); 3]
+        });
+        if let Some(seed) = noise {
+            let mut rng = Rng(seed * 0x9e37_79b9 + 3);
+            for p in img.data.iter_mut() {
+                let s = p[0];
+                *p = [(s + (2e-5 * s + 2e-8).sqrt() * rng.gauss()).max(0.0); 3];
+            }
+        }
+        img
+    };
+    let frames: Vec<Rgb32f> = (0..HN)
+        .map(|k| {
+            let f = k as f64 / (HN - 1) as f64;
+            shot(f * HSIGMA, (1.0 - f) * HSIGMA, Some(k as u64 + 1))
+        })
+        .collect();
+    let truth = shot(0.0, 0.0, None);
+    let load = |i: usize, _: Load| -> Result<Frame, MergeError> { Ok(Frame::from_linear_rec2020(frames[i].clone(), None)) };
+    let r = stack_focus(HN, &load, &FocusOptions { align: false }, &no_progress).unwrap();
+    let ring = |x: usize, y: usize| {
+        let d = ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt();
+        (d - rad).abs() < 30.0
+    };
+    // a halo: the error left after a σ = 4 px blur (texture and noise averaged out), in the ring
+    let lowpass = |img: &Rgb32f| gaussian(&img.map(|p| p[1].max(0.0).sqrt()), 4.0);
+    let (lr, lt) = (lowpass(&r.image), lowpass(&truth));
+    let (mut e, mut n) = (0f64, 0usize);
+    for y in 0..HH {
+        for x in 0..HW {
+            if ring(x, y) {
+                e += (lr.get(x, y) - lt.get(x, y)).abs() as f64;
+                n += 1;
+            }
+        }
+    }
+    let halo = e / n as f64;
+    let gain = detail_gain(&r.image, &truth, ring).unwrap();
+    let inside = detail_gain(&r.image, &truth, |x, y| ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt() < rad - 40.0).unwrap();
+    let outside = detail_gain(&r.image, &truth, |x, y| {
+        let d = ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt();
+        d > rad + 40.0 && x > 40 && y > 40 && x < HW - 40 && y < HH - 40
+    })
+    .unwrap();
+    eprintln!("edge halo {halo:.4} (√ units), texture kept at the edge {gain:.3}, inside {inside:.3}, outside {outside:.3}");
+    assert!(halo < 0.004, "edge halo {halo}");
+    assert!(gain > 0.85 && inside > 0.98 && outside > 0.98, "texture kept: edge {gain}, inside {inside}, outside {outside}");
+}

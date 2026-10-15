@@ -130,6 +130,11 @@ scale in `BaselineExposure`; raw sources keep their DNG colour tags (camera RGB)
   aligned on versions 8× smaller as a 61 MP raw's are. Before: corner errors up to 1.9 px (the chain), texture
   56 / 72 / 73 % (high / mid / low contrast) of an ideal stack's (each pixel from its best-focused frame, noiseless);
   with the Lanczos-3 warp alone (versions 2.7× smaller) 78.5 → 98 %. Now: 0.03 px, 98.3 / 98.5 / 99 %.
+- Focus stack, edges: a textured disc near the camera in front of a textured background (5 frames, defocus as blurred
+  layers, so a background-focused frame shows the disc's blur spilling over the background). Around the disc's edge
+  the low-frequency error is 0.0025 (√ units) and 88 % of the texture is kept (100 % away from the edge). Measured
+  worse and not kept: one sharpness map per frame used for every band (a depth map: 0.0063 and 84 %, 1.7× slower),
+  and the activity window at σ = 2 or 5 (within noise of 3).
 - Focus stack, real: every 2nd frame (88) of a Sony A7R VI macro bracket (FE 100 mm, f/5.6), a
   2400 × 1500 crop of petal edges and out-of-focus background (a throwaway harness):
   background noise (8-bit high-pass) 0.39 / 0.33 / 0.56 (R / G / B) against 1.7 / 1.3 / 2.6 for a
