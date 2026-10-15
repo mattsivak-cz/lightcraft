@@ -13,8 +13,12 @@
 //! 2. **Brightness**: each frame's against the one it is chained to, measured as the median log
 //!    ratio of their aligned luminance thumbnails where both are well exposed (EXIF only when that
 //!    fails: auto ISO may change the tags without changing the raw data), chained to the reference.
-//! 3. **Fuse** at full size, one frame at a time ([`Fuser`]): each frame is brought to the
-//!    reference's brightness, resampled into its geometry and decomposed into a Laplacian pyramid
+//! 3. **Fuse** at full size, one frame at a time ([`Fuser`]), outwards from the reference: each
+//!    frame's chained alignment is refined at full size against its neighbour, already aligned
+//!    ([`crate::refine`], a similarity; on small versions 8× below the frame the chain was up to
+//!    1.9 px off at the corners, refined 0.03 px). Each frame is brought to the reference's
+//!    brightness, resampled into its geometry (Lanczos-3: bilinear lost a fifth of the texture,
+//!    every frame being magnified a little differently) and decomposed into a Laplacian pyramid
 //!    (in square-root space, so shadows count). Every band is the weighted mean of the frames'
 //!    bands: with `e` the local energy of the band's luminance, summed over a window
 //!    ([`ACTIVITY_SIGMA`]) wider than a defocused edge spreads, and `ε` the band's noise floor (a
@@ -43,6 +47,7 @@ use crate::frame::{Frame, FrameColor};
 use crate::pano::blend::{Buf, down_into, sub_up, up};
 use crate::ransac::Model;
 use crate::{MergeError, Progress, Result, check};
+use crate::{flow, refine};
 
 /// Gaussian window (pixels of each pyramid level) over which a band's energy is summed. 1 leaves
 /// halos beside edges; 3 to 12 measure alike on the synthetic bracket (`tests/focus.rs`).
@@ -55,6 +60,9 @@ const SHARPNESS_POWER: f32 = 16.0;
 const NOISE_MARGIN: f32 = 2.0;
 /// Quantile of the first frame's band energy taken as the band's noise floor.
 const NOISE_QUANTILE: f64 = 0.1;
+/// Largest search radius (full-resolution pixels) refining a frame against its neighbour: the error left by the
+/// chained small-version alignment, relative to an already refined neighbour.
+const REFINE_RADIUS: usize = 8;
 /// How many frames back a frame whose neighbour step fails is tried against.
 pub const BRIDGE: usize = 3;
 /// Long edge of the luminance thumbnails brightness is measured on.
@@ -144,14 +152,16 @@ pub fn stack_focus(n: usize, load: &Loader, opts: &FocusOptions, progress: &Prog
             return Err(no_pixels(i));
         }
         let gain = 0.18 / align::median_luma(&f.image, f.clip).max(1e-6);
+        // features are found on the work image, so its size is the small frame's (a loader may hand over more than
+        // WORK_EDGE pixels)
         let (p, _) = align::work_image(&f.image, gain, align::WORK_EDGE);
         let thumb = fit(&f.image, THUMB_EDGE, THUMB_EDGE, Filter::Box).map(|c| 0.25 * c[0] + 0.6 * c[1] + 0.15 * c[2]);
         let k = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         check(progress, 0.25 * k as f32 / n as f32, "Aligning")?;
         Ok(Small {
             features: crate::features::detect(&p, 1500),
-            width: f.width(),
-            height: f.height(),
+            width: p.width,
+            height: p.height,
             exposure: f.exposure.filter(|e| e.is_finite()),
             thumb,
             clip: f.clip,
@@ -253,11 +263,21 @@ pub fn stack_focus(n: usize, load: &Loader, opts: &FocusOptions, progress: &Prog
     let ev: Vec<f64> = (0..n).map(|i| if root[i] == best { (lb[i] - lb[reference]) / std::f64::consts::LN_2 } else { 0.0 }).collect();
     check(progress, 0.3, "Stacking")?;
 
-    // 3. fuse at full size, one frame at a time
+    // 3. fuse at full size, one frame at a time, outwards from the reference: each frame's chained alignment is
+    //    refined at full size against its neighbour, already aligned (neighbours share the most sharp detail)
     let mut fuser: Option<Fuser> = None;
     let mut alignments = vec![Alignment { model: "failed", ..Alignment::identity() }; n];
     let mut reference_frame: Option<Frame> = None;
-    for (k, &i) in used.iter().enumerate() {
+    let below: Vec<usize> = used.iter().rev().copied().filter(|&i| i < reference).collect();
+    let above: Vec<usize> = used.iter().copied().filter(|&i| i > reference).collect();
+    let order: Vec<usize> = std::iter::once(reference).chain(below.iter().copied()).chain(above.iter().copied()).collect();
+    // the reference's luminance (for the frames above it) and the last frame's, both in the reference's geometry
+    let mut ref_luma: Option<Plane> = None;
+    let mut prev: Option<Plane> = None;
+    for (k, &i) in order.iter().enumerate() {
+        if above.first() == Some(&i) {
+            prev = ref_luma.take();
+        }
         let mut f = load(i, if i == reference { Load::Reference } else { Load::Stack })?;
         let (w, h) = (f.width(), f.height());
         if w == 0 || h == 0 {
@@ -271,7 +291,7 @@ pub fn stack_focus(n: usize, load: &Loader, opts: &FocusOptions, progress: &Prog
             return Err(MergeError::Mismatch("focus stacking needs photos of the same size".into()));
         }
         let scale = sw as f64 / w as f64;
-        let hfull = align::scale_homography(&chain[i].mul(&to_ref), scale);
+        let mut hfull = align::scale_homography(&chain[i].mul(&to_ref), scale);
         let (model, inliers, rms) = match (i == reference, &link[i]) {
             (true, _) => ("reference", 0, 0.0),
             (false, Some((_, a))) => (a.model, a.inliers, a.rms / scale),
@@ -280,6 +300,24 @@ pub fn stack_focus(n: usize, load: &Loader, opts: &FocusOptions, progress: &Prog
         };
         alignments[i] = Alignment { h: hfull, model, inliers, rms };
         let gain = (-ev[i] * std::f64::consts::LN_2).exp().clamp(1.0 / 16.0, 16.0) as f32;
+        if opts.align {
+            let l = refine::luma(&f.image, 0.18 / align::median_luma(&f.image, f.clip).max(1e-6), f.clip);
+            if let Some(p) = &prev
+                && i != reference
+            {
+                let start = Alignment { model: "similarity", ..alignments[i].clone() };
+                let r = refine::refine_with(p, &l, &start, refine::radius_for(scale).min(REFINE_RADIUS), (i + 1) as u64, &refine::SIMILARITY);
+                if r.inliers > 0 && r.h != start.h {
+                    hfull = r.h;
+                    alignments[i] = Alignment { h: r.h, model: r.model, inliers: r.inliers, rms: r.rms };
+                }
+            }
+            let warped = if i == reference { l } else { flow::warp_plane(&l, &hfull) };
+            if i == reference && !above.is_empty() {
+                ref_luma = Some(warped.clone());
+            }
+            prev = Some(warped);
+        }
         fu.fill(&f.image, (i != reference).then_some(&hfull), gain);
         // only the reference's colour and metadata are kept, never its pixels
         f.image = Rgb32f::new(0, 0);
@@ -409,7 +447,7 @@ impl Fuser {
                     Some(h) => {
                         let q = h.apply(Point::new(sx as f64 + 0.5, sy as f64 + 0.5));
                         let ok = q.x >= 0.0 && q.y >= 0.0 && q.x <= w as f64 && q.y <= ht as f64;
-                        (img.sample_bilinear(q.x as f32, q.y as f32), ok)
+                        (img.sample_lanczos3(q.x as f32, q.y as f32), ok)
                     }
                 };
                 for c in 0..3 {

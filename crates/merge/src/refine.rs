@@ -246,6 +246,10 @@ fn correlation(a: &[f32], b: impl Fn(usize, usize) -> f32) -> Option<f32> {
 pub const ALL_MODELS: [(Model, &str, usize); 3] =
     [(Model::Translation, "translation", 6), (Model::Similarity, "similarity", 8), (Model::Homography, "homography", 12)];
 
+/// Similarity only (a focus stack: focusing magnifies, a tripod adds nothing else, and a homography fitted to the
+/// sharp slice of a frame extrapolates badly).
+pub const SIMILARITY: [(Model, &str, usize); 1] = [(Model::Similarity, "similarity", 8)];
+
 /// Search radius (pixels) for a frame with no alignment to start from (the small versions found
 /// none: a bright frame mostly clipped, too little texture left for features).
 pub const RECOVER_RADIUS: usize = 16;

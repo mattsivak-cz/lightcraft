@@ -82,8 +82,9 @@ the pixels both see away from clipping (sums, because blur keeps them while per-
 differently blurred frames lean one way); steps under 0.05 EV count as none, so measuring noise
 can't wander over a long stack; EXIF only when the pixels can't tell. Measured, not read from
 EXIF: on a Sony A7R VI, auto ISO's 160 → 125 left the raw data as bright. Then full size, one frame
-at a time: brought to the reference's brightness, resampled into its geometry straight onto the
-fusion canvas, decomposed into a Laplacian pyramid in square-root space. Every band is the mean of
+at a time, outwards from the reference: the chained alignment refined at full size against the neighbour already
+aligned (`refine.rs`, similarity only, ±8 px), brought to the reference's brightness, resampled (Lanczos-3) into its
+geometry straight onto the fusion canvas, decomposed into a Laplacian pyramid in square-root space. Every band is the mean of
 the frames' bands, weighted by their energy `e`: that of the band's luminance summed over a
 Gaussian window (σ = 3 level pixels) wider than a defocused edge spreads (else the blurred frame
 wins just beside every sharp edge: a halo), against the band's noise floor `ε` (the 10th
@@ -124,6 +125,11 @@ scale in `BaselineExposure`; raw sources keep their DNG colour tags (camera RGB)
   linear) against 0.103 for the best single frame; frames darkened ½ EV each are measured within
   0.04 EV, without EXIF or with wrong EXIF; a featureless frame is left out and bridged over;
   noise in equally blurred areas drops to 0.36× a single frame's (8 frames).
+- Focus stack at full size (`tests/focus_sharpness.rs`): 9 frames 3200 × 2000 of an analytic scene (waves up to
+  0.33 cycles per pixel and Gaussian blobs, whose defocus is exact; σ up to 6 px; 0.4 % breathing per frame; noise),
+  aligned on versions 8× smaller as a 61 MP raw's are. Before: corner errors up to 1.9 px (the chain), texture
+  56 / 72 / 73 % (high / mid / low contrast) of an ideal stack's (each pixel from its best-focused frame, noiseless);
+  with the Lanczos-3 warp alone (versions 2.7× smaller) 78.5 → 98 %. Now: 0.03 px, 98.3 / 98.5 / 99 %.
 - Focus stack, real: every 2nd frame (88) of a Sony A7R VI macro bracket (FE 100 mm, f/5.6), a
   2400 × 1500 crop of petal edges and out-of-focus background (a throwaway harness):
   background noise (8-bit high-pass) 0.39 / 0.33 / 0.56 (R / G / B) against 1.7 / 1.3 / 2.6 for a
@@ -153,9 +159,7 @@ scale in `BaselineExposure`; raw sources keep their DNG colour tags (camera RGB)
   photos are decoded one at a time. Measured on 67 MP raws: 3 frames 3.8 GB, 4 frames 4.7 GB, 5 frames 5.5 GB (was
   4.8 / 6.3 GB for 3 / 4). Half-float frames would halve the per-frame share.
 - The browser build has no file access for merges yet.
-- Focus stacks: chained alignment accumulates error over long stacks (features move as the blur
-  differs between neighbours: up to 0.2 % of the frame on the strongly blurred synthetic bracket;
-  none visible on a real 175-frame macro stack); a similarity only, so a camera moved between
+- Focus stacks: a similarity only, so a camera moved between
   shots (rotation about the lens's side, tilt) is not followed; no retouching from single frames,
   no depth-map mode, no halo control; frames must share their size. A preview keeps its ≤ 1024 px
   frames between the two passes (≈ 8 MB each).
