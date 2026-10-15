@@ -374,15 +374,45 @@ pub fn is_supported(path: &Path) -> bool {
 }
 
 /// The photos directly in `dir` (no subfolders, no hidden files) as browsing it lists them, sorted.
+/// What an entry is comes from the listing itself: asking the disk about each one is a round trip
+/// per file on a network share (seconds for a folder of a thousand raws); only a link is followed.
 pub fn list_folder(dir: &Path) -> std::io::Result<Vec<String>> {
     let mut v: Vec<String> = std::fs::read_dir(dir)?
         .flatten()
-        .map(|e| e.path())
-        .filter(|f| f.is_file() && is_supported(f) && !f.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
-        .map(|f| f.to_string_lossy().to_string())
+        .filter_map(|e| {
+            let p = e.path();
+            if !is_supported(&p) || p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+                return None;
+            }
+            let file = match e.file_type() {
+                Ok(t) if !t.is_symlink() => t.is_file(),
+                _ => p.is_file(),
+            };
+            file.then(|| p.to_string_lossy().to_string())
+        })
         .collect();
     v.sort();
     Ok(v)
+}
+
+/// List a browsed folder (Local) — its own photos, or with its subfolders — handing them to `found`
+/// as they are found: a folder's photos as soon as that folder is listed, several folders listed at
+/// once ([`crate::walk::files_in_parallel`]). On a network share each listing takes a second or more,
+/// so a tree of hundreds of folders takes minutes; what is found meanwhile can already be shown and
+/// read. Stops early once `cancel` is set.
+pub fn list_browsed(dir: &str, subfolders: bool, cancel: &std::sync::atomic::AtomicBool, found: impl Fn(Vec<String>) + Sync) {
+    if !subfolders {
+        found(list_folder(Path::new(dir)).unwrap_or_default());
+        return;
+    }
+    let limits = crate::walk::Limits::default();
+    let threads = crate::walk::PARALLEL_LISTINGS;
+    let truncated = crate::walk::files_in_parallel(Path::new(dir), limits, threads, is_supported, cancel, |files| {
+        found(files.into_iter().map(|f| f.to_string_lossy().to_string()).collect());
+    });
+    if truncated {
+        log::warn!("browse: stopped looking in {dir} (limits: {} entries, {} folder levels)", limits.max_entries, limits.max_depth);
+    }
 }
 
 /// Expand files and folders (recursively) into supported files. `skip` (e.g. the library folder)
@@ -969,13 +999,6 @@ impl ImportJob {
         let files = expand(paths, self.lib_dir.as_deref());
         self.total.fetch_add(files.len(), std::sync::atomic::Ordering::Relaxed);
         files
-    }
-
-    /// The files of a browsed folder `dir` (Local): with its subfolders, or only its own photos
-    /// ([`list_folder`]). Not counted in [`ImportJob::total`]: a browse reads only the ones
-    /// [`ImportJob::split_known`] finds new.
-    pub fn expand_folder(&self, dir: &str, subfolders: bool) -> Vec<String> {
-        if subfolders { expand(&[dir.to_string()], None) } else { list_folder(Path::new(dir)).unwrap_or_default() }
     }
 
     /// `files` split into those the library already has (by path) and the rest, each in order: a
