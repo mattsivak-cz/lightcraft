@@ -270,6 +270,9 @@ pub struct ImportTask {
     /// Browsing (Local): the folder, and whether its subfolders are included. The worker lists it
     /// (a network share can take minutes) and reads only the files the library doesn't know yet.
     folder: Option<(String, bool)>,
+    /// Browsing: finding the Local records of files gone from the folder, run by the worker once it has
+    /// listed it (it looks at files on disk, which on a network share can take seconds each).
+    gone: Option<lightcraft_engine::cmd::browse::GoneCheck>,
     /// Browsing: the listed files not read yet, shown as placeholders in the grid.
     pending: Pending,
     run: Option<ImportRun>,
@@ -286,9 +289,9 @@ impl ImportTask {
     /// Read the folder `dir` (with its subfolders when `subfolders`) for the Local view: the photos
     /// the library already has show at once, the others join it batch by batch, each shown as a
     /// placeholder until it is read.
-    pub fn browse(dir: String, subfolders: bool, undo0: usize) -> Self {
+    pub fn browse(dir: String, subfolders: bool, undo0: usize, gone: lightcraft_engine::cmd::browse::GoneCheck) -> Self {
         let params = json!({"mode": "add", "local": true});
-        ImportTask { params, undo0, browse: true, folder: Some((dir, subfolders)), ..Default::default() }
+        ImportTask { params, undo0, browse: true, folder: Some((dir, subfolders)), gone: Some(gone), ..Default::default() }
     }
 
     /// The folder this task reads for the Local view, and whether with its subfolders.
@@ -330,9 +333,9 @@ struct Pending {
 
 /// What an import's worker hands the UI thread.
 enum Readied {
-    /// Browsing: the folder was listed — the files the library already has, and the ones it will read
-    /// (in that order).
-    Listed { known: Vec<String>, new: Vec<String> },
+    /// Browsing: the folder was listed — the files it will read (the library doesn't know them yet), and
+    /// the Local records of files gone from it.
+    Listed { new: Vec<String>, gone: Vec<lightcraft_catalog::PhotoId> },
     /// A batch of files readied for the catalog.
     Batch(lightcraft_engine::import::Prepared),
 }
@@ -347,6 +350,7 @@ enum Runner {
         job: Box<lightcraft_engine::import::ImportJob>,
         queue: Vec<String>,
         folder: Option<(String, bool)>,
+        gone: Option<lightcraft_engine::cmd::browse::GoneCheck>,
         files: Option<std::collections::VecDeque<String>>,
     },
 }
@@ -380,6 +384,7 @@ impl ImportRun {
         job: lightcraft_engine::import::ImportJob,
         queue: Vec<String>,
         folder: Option<(String, bool)>,
+        gone: Option<lightcraft_engine::cmd::browse::GoneCheck>,
         album: Option<u64>,
         album_name: Option<String>,
         ctx: &egui::Context,
@@ -387,7 +392,7 @@ impl ImportRun {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (total, done) = (job.total.clone(), job.done.clone());
         let (opts, now) = (job.opts.clone(), job.now().to_string());
-        let runner = Self::spawn(job, queue, folder, cancel.clone(), ctx)?;
+        let runner = Self::spawn(job, queue, folder, gone, cancel.clone(), ctx)?;
         Ok(ImportRun { runner, cancel, total, done, opts, now, album, album_name })
     }
 
@@ -396,6 +401,7 @@ impl ImportRun {
         mut job: lightcraft_engine::import::ImportJob,
         queue: Vec<String>,
         folder: Option<(String, bool)>,
+        gone: Option<lightcraft_engine::cmd::browse::GoneCheck>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         ctx: &egui::Context,
     ) -> Result<Runner, String> {
@@ -405,7 +411,8 @@ impl ImportRun {
             let files = match &folder {
                 Some((dir, subfolders)) => {
                     let (known, new) = list_browsed(&mut job, dir, *subfolders);
-                    if tx.send(Readied::Listed { known, new: new.clone() }).is_err() {
+                    let gone = gone_of(gone.as_ref(), &known, &new);
+                    if tx.send(Readied::Listed { new: new.clone(), gone }).is_err() {
                         return;
                     }
                     ctx.request_repaint();
@@ -440,10 +447,11 @@ impl ImportRun {
         job: lightcraft_engine::import::ImportJob,
         queue: Vec<String>,
         folder: Option<(String, bool)>,
+        gone: Option<lightcraft_engine::cmd::browse::GoneCheck>,
         _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         _ctx: &egui::Context,
     ) -> Result<Runner, String> {
-        Ok(Runner::Inline { job: Box::new(job), queue, folder, files: None })
+        Ok(Runner::Inline { job: Box::new(job), queue, folder, gone, files: None })
     }
 
     /// What the worker readied (at most a few batches per frame). `None` once it is done.
@@ -462,7 +470,7 @@ impl ImportRun {
                 Some(out)
             }
             #[cfg(target_arch = "wasm32")]
-            Runner::Inline { job, queue, folder, files } => {
+            Runner::Inline { job, queue, folder, gone, files } => {
                 if self.cancel.load(Ordering::Relaxed) {
                     return None;
                 }
@@ -471,7 +479,8 @@ impl ImportRun {
                         Some((dir, subfolders)) => {
                             let (known, new) = list_browsed(job, dir, *subfolders);
                             *files = Some(new.clone().into());
-                            vec![Readied::Listed { known, new }]
+                            let gone = gone_of(gone.as_ref(), &known, &new);
+                            vec![Readied::Listed { new, gone }]
                         }
                         None => {
                             *files = Some(job.expand(queue).into());
@@ -497,6 +506,14 @@ fn list_browsed(job: &mut lightcraft_engine::import::ImportJob, dir: &str, subfo
     let (known, new) = job.split_known(job.expand_folder(dir, subfolders));
     job.total.fetch_add(new.len(), Ordering::Relaxed);
     (known, new)
+}
+
+/// The Local records of files gone from a browsed folder that listed `known` and `new` (see
+/// [`ImportTask::gone`]).
+fn gone_of(check: Option<&lightcraft_engine::cmd::browse::GoneCheck>, known: &[String], new: &[String]) -> Vec<lightcraft_catalog::PhotoId> {
+    let Some(check) = check else { return Vec::new() };
+    let all: Vec<String> = known.iter().chain(new).cloned().collect();
+    check.run(&all)
 }
 
 /// A folder scan running on a worker thread (a network share can take minutes to read; the
@@ -576,7 +593,8 @@ pub fn open(app: &mut LightcraftApp, paths: Vec<String>) -> Result<Value, String
 /// import or the import review's scan is not.
 pub fn browse(app: &mut LightcraftApp, path: &str, subfolders: Option<bool>) -> Result<Value, String> {
     let dir = std::path::absolute(std::path::Path::new(path)).map_err(|e| e.to_string())?;
-    if !dir.is_dir() {
+    // a folder on a network share can take seconds to answer: then the worker finds out (an empty folder)
+    if crate::panels::left::is_dir_quickly(&dir) == Some(false) {
         return Err(format!("{path}: not a folder"));
     }
     if app.scan.is_some() || app.import.as_ref().is_some_and(|t| !t.browse) {
@@ -595,7 +613,8 @@ pub fn browse(app: &mut LightcraftApp, path: &str, subfolders: Option<bool>) -> 
     app.session.source = lightcraft_engine::LibrarySource::Folder;
     // the photos the library already knows from this folder show at once: keep or pick the active one
     app.session.keep_active_in_view();
-    app.import = Some(ImportTask::browse(dir_s.clone(), subfolders, app.session.undo.len()));
+    let gone = app.session.gone_check(&dir_s, subfolders);
+    app.import = Some(ImportTask::browse(dir_s.clone(), subfolders, app.session.undo.len(), gone));
     app.renderer.forget_imports();
     Ok(json!({"path": dir_s, "subfolders": subfolders, "scanning": true}))
 }
@@ -732,7 +751,9 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
         let started = lightcraft_engine::cmd::library::import_params(&app.session, &p)
             .and_then(|req| Ok((lightcraft_engine::import::ImportJob::new(&mut app.session, req.opts)?, req.album, req.album_name)))
             .map_err(|e| e.to_string())
-            .and_then(|(job, album, name)| ImportRun::start(job, std::mem::take(&mut task.queue), task.folder.clone(), album, name, ctx));
+            .and_then(|(job, album, name)| {
+                ImportRun::start(job, std::mem::take(&mut task.queue), task.folder.clone(), task.gone.take(), album, name, ctx)
+            });
         if task.auto {
             task.keep_selection = Some(app.session.selection.clone());
         }
@@ -758,8 +779,8 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
     }
     for readied in batches.into_iter().flatten() {
         let prepared = match readied {
-            Readied::Listed { known, new } => {
-                listed(app, &mut task, known, new);
+            Readied::Listed { new, gone } => {
+                listed(app, &mut task, new, &gone);
                 continue;
             }
             Readied::Batch(p) => p,
@@ -795,12 +816,11 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
 }
 
 /// A browsed folder was listed: records of files gone from it that nothing was changed on go (as
-/// `library.browse` forgets them, issue #1392), and the files to read show as placeholders.
-fn listed(app: &mut LightcraftApp, task: &mut ImportTask, known: Vec<String>, new: Vec<String>) {
-    if let Some((dir, subfolders)) = task.folder.clone() {
-        let mut all = known;
-        all.extend(new.iter().cloned());
-        app.session.forget_gone_from(&dir, subfolders, &all);
+/// `library.browse` forgets them, issue #1392; the worker found them), and the files to read show as
+/// placeholders.
+fn listed(app: &mut LightcraftApp, task: &mut ImportTask, new: Vec<String>, gone: &[lightcraft_catalog::PhotoId]) {
+    if let Some((dir, _)) = &task.folder {
+        app.session.forget_gone(dir, gone);
     }
     task.pending = Pending { listed: true, files: new, read: 0 };
 }
