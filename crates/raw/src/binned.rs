@@ -268,3 +268,77 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod list3_tests {
+    use crate::demosaic::mosaic_from_rgb;
+    use crate::opcodes::{Area, Opcode};
+    use crate::*;
+
+    fn raw(list3: Vec<Opcode>) -> RawImage {
+        let img = Rgb32f::from_fn(32, 24, |x, y| [0.1 + x as f32 * 0.005, 0.2 + y as f32 * 0.005, 0.25]);
+        let n = mosaic_from_rgb(&img, &Cfa::bayer("RGGB").unwrap());
+        RawImage {
+            format: RawFormat::Dng,
+            width: n.width,
+            height: n.height,
+            cpp: 1,
+            data: RawData::U16(n.data.iter().map(|&v| (v * 16383.0).round() as u16).collect()),
+            cfa: n.cfa.clone(),
+            bits: 14,
+            black: BlackLevel::uniform(0.0),
+            white: vec![16383.0],
+            active_area: Rect::new(0, 0, n.width, n.height),
+            crop: Rect::new(2, 2, 28, 20),
+            orientation: Orientation::Normal,
+            color: ColorData::default(),
+            wb_multipliers: None,
+            linearized: false,
+            pixel_aspect: 1.0,
+            opcodes: OpcodeLists { list3, ..Default::default() },
+            metadata: Metadata::default(),
+            lens_metadata: Default::default(),
+        }
+    }
+
+    fn area() -> Area {
+        Area { top: 0, left: 0, bottom: 24, right: 32, plane: 0, planes: 3, row_pitch: 1, col_pitch: 1 }
+    }
+
+    /// A lens-shading gain map in `OpcodeList3` (as DJI DNGs carry) no longer forces a full-size develop: the binned
+    /// image gets it at its own scale, and the default crop after it.
+    #[test]
+    fn a_gain_map_applies_to_the_binned_image() {
+        let gain =
+            Opcode::GainMap { area: area(), points_v: 2, points_h: 2, spacing: [1.0, 1.0], origin: [0.0, 0.0], map_planes: 1, gains: vec![2.0; 4] };
+        let plain = raw(Vec::new()).develop_binned(2, 0.99).unwrap().unwrap();
+        let shaded = raw(vec![gain]).develop_binned(2, 0.99).unwrap().expect("binned despite OpcodeList3");
+        assert_eq!((shaded.width, shaded.height), (plain.width, plain.height));
+        assert_eq!((plain.width, plain.height), (14, 10), "the default crop at the binned scale");
+        for (a, b) in plain.data.iter().zip(&shaded.data) {
+            for c in 0..3 {
+                assert!((b[c] - 2.0 * a[c]).abs() < 1e-4, "{a:?} {b:?}");
+            }
+        }
+    }
+
+    /// An operation that needs every pixel (per-row deltas) still refuses binning: the caller demosaics.
+    #[test]
+    fn a_per_row_opcode_refuses_binning() {
+        let rows = Opcode::DeltaPerRow { area: area(), deltas: vec![0.01; 24] };
+        assert!(raw(vec![rows]).develop_binned(2, 0.99).unwrap().is_none());
+        assert!(
+            Opcode::GainMap {
+                area: Area { row_pitch: 2, ..area() },
+                points_v: 1,
+                points_h: 1,
+                spacing: [1.0, 1.0],
+                origin: [0.0, 0.0],
+                map_planes: 1,
+                gains: vec![1.0]
+            }
+            .binned(2)
+            .is_none()
+        );
+    }
+}
