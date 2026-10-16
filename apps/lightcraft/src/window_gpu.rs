@@ -475,11 +475,20 @@ mod tests {
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
-            eprintln!("no GPU adapter: skipped");
+            lightcraft_testkit::skip!(Gpu, "no GPU adapter");
             return;
         };
+        // Mesa's software Vulkan (lavapipe, the FreeBSD CI runner) segfaults when a destroyed
+        // device is used, where real drivers report the loss: nothing to learn there.
+        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+            lightcraft_testkit::skip!(Gpu, "software adapter {} crashes on a destroyed device", adapter.get_info().name);
+            return;
+        }
         let desc = wgpu::DeviceDescriptor { required_limits: lightcraft_engine::gpu::window_device_limits(&adapter), ..Default::default() };
-        let Ok((device, queue)) = pollster::block_on(adapter.request_device(&desc)) else { return };
+        let Ok((device, queue)) = pollster::block_on(adapter.request_device(&desc)) else {
+            lightcraft_testkit::skip!(Gpu, "no GPU device");
+            return;
+        };
         install_error_handler(&device);
         let format = wgpu::TextureFormat::Bgra8Unorm;
         let mut renderer = Renderer::new(&device, format, RendererOptions::default());
