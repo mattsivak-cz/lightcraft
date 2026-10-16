@@ -478,10 +478,12 @@ mod tests {
             lightcraft_testkit::skip!(Gpu, "no GPU adapter");
             return;
         };
-        // Mesa's software Vulkan (lavapipe, the FreeBSD CI runner) segfaults when a destroyed
-        // device is used, where real drivers report the loss: nothing to learn there.
-        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
-            lightcraft_testkit::skip!(Gpu, "software adapter {} crashes on a destroyed device", adapter.get_info().name);
+        // Software adapters and wgpu's GL backend (Mesa GL on the FreeBSD CI runner, which has no
+        // Vulkan driver) segfault when a destroyed device is used, where Metal, DX12 and hardware
+        // Vulkan report the loss: nothing to learn there.
+        let info = adapter.get_info();
+        if info.device_type == wgpu::DeviceType::Cpu || info.backend == wgpu::Backend::Gl {
+            lightcraft_testkit::skip!(Gpu, "{} adapter {} crashes on a destroyed device", info.backend, info.name);
             return;
         }
         let desc = wgpu::DeviceDescriptor { required_limits: lightcraft_engine::gpu::window_device_limits(&adapter), ..Default::default() };
