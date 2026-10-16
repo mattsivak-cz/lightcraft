@@ -1,0 +1,44 @@
+#!/bin/sh
+# git pre-push hook: after a push to the mattsivak/lightcraft fork, start .github/workflows/fork-ci.yml
+# (on the fork's main) for every pushed branch. Install with .github/fork-ci/install-hook.sh.
+#
+# Never blocks or fails the push: it forks a background job that waits until the pushed commit is on
+# GitHub, then dispatches the workflow. Log: $(git rev-parse --git-common-dir)/fork-ci.log.
+# Opt out for one push: FORK_CI=0 git push ...
+
+remote_url=$2
+[ "${FORK_CI:-1}" = 0 ] && exit 0
+case "$remote_url" in
+  *github.com[:/]mattsivak/lightcraft|*github.com[:/]mattsivak/lightcraft.git) ;;
+  *) exit 0 ;;
+esac
+command -v gh >/dev/null 2>&1 || exit 0
+
+repo=mattsivak/lightcraft
+log="$(git rev-parse --git-common-dir)/fork-ci.log"
+zero=0000000000000000000000000000000000000000
+
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue # branch deletion
+  case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac
+  branch=${remote_ref#refs/heads/}
+  [ "$branch" = main ] && continue # main runs fork-ci.yml from its own push trigger
+  (
+    # wait (up to ~5 min) for the push to land, then dispatch
+    i=0
+    while [ $i -lt 60 ]; do
+      if [ "$(git ls-remote "$remote_url" "$remote_ref" 2>/dev/null | cut -f1)" = "$local_sha" ]; then
+        if gh workflow run fork-ci.yml -R "$repo" --ref main -f ref="$branch" -f sha="$local_sha" >/dev/null 2>&1; then
+          echo "$(date '+%F %T') dispatched fork-ci for $branch @ $local_sha"
+        else
+          echo "$(date '+%F %T') FAILED to dispatch fork-ci for $branch @ $local_sha"
+        fi
+        exit 0
+      fi
+      i=$((i + 1))
+      sleep 5
+    done
+    echo "$(date '+%F %T') gave up: $branch never reached $local_sha on $repo (push rejected?)"
+  ) >>"$log" 2>&1 </dev/null &
+done
+exit 0

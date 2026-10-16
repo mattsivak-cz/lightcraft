@@ -1,0 +1,222 @@
+# CI for the mattsivak/lightcraft fork: the same gate as `cargo xtask ci`, run on GitHub instead of locally.
+#
+# Feature branches are cut from upstream main, which has no CI workflow, and GitHub runs a `push`
+# workflow from the pushed branch's own tree. So this workflow lives only on the fork's main and is
+# started per branch by `workflow_dispatch` with the branch to test; it checks that branch out. The
+# local `pre-push` hook (`.github/fork-ci/pre-push`, installed by `.github/fork-ci/install-hook.sh`)
+# dispatches it after every push to the fork. By hand:
+#   gh workflow run fork-ci.yml -R mattsivak/lightcraft --ref main -f ref=<branch>
+# The result is posted as a `fork-ci` commit status on the tested commit (visible on the fork's
+# branch and commit pages) and as a run named after the branch in the fork's Actions tab.
+#
+# - Linux runs `cargo xtask ci` (fmt, clippy, heif, tests, parity, layers, assets, wasm) with the
+#   craft-fonts input, then the GPU tests on Mesa's lavapipe.
+# - macOS and Windows run what differs per platform: clippy and the workspace tests (code behind
+#   `cfg(target_os)` only compiles there), then the GPU tests on Metal / WARP.
+# - `LIGHTCRAFT_GPU_ALLOW_SOFTWARE=1` (tests only) lets the GPU tests use a software adapter; the GPU
+#   step fails if they skip anyway.
+# Standard GitHub-hosted runners only (free for a public repository).
+name: Fork CI
+run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}"
+
+on:
+  # the fork's main has this file, so its pushes run it directly; the hook skips main
+  push:
+    branches: [main, fork-ci]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch (or tag) of this repository to test"
+        type: string
+        required: true
+      sha:
+        description: "Exact commit to test (empty: the branch's current head)"
+        type: string
+        default: ""
+      platforms:
+        description: "Which jobs to run"
+        type: choice
+        options: [all, linux]
+        default: all
+
+# A newer push of the same branch cancels the older run.
+concurrency:
+  group: fork-ci-${{ inputs.ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # what `cargo xtask ci` uses: backtraces with line numbers, a fraction of full debuginfo's RAM and cache
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  RUST_BACKTRACE: 1
+  CRAFT_FONTS_REF: 3d9ab3a132ed0eff457e424226a435a901da30d3 # same pin as release.yml
+
+jobs:
+  resolve:
+    name: Resolve commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      statuses: write
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - id: sha
+        name: Resolve and mark pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref || github.ref_name }}
+          SHA: ${{ inputs.sha || github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SHA" ]; then
+            SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" --jq .sha)
+          fi
+          # the push may still be landing when the hook dispatches: wait for the commit to exist
+          for _ in $(seq 30); do
+            gh api "repos/$GITHUB_REPOSITORY/commits/$SHA" --jq .sha >/dev/null 2>&1 && break
+            sleep 10
+          done
+          SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA" --jq .sha)
+          echo "sha=$SHA" >>"$GITHUB_OUTPUT"
+          echo "### Testing \`$REF\` at \`${SHA::9}\`" >>"$GITHUB_STEP_SUMMARY"
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending -f context=fork-ci \
+            -f description="running" -f target_url="$RUN_URL" >/dev/null
+
+  linux:
+    name: Linux x86_64 (xtask ci, GPU tests on lavapipe)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+      CRAFT_FONTS_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      # Optional font build input, so the Japanese and Chinese font tests run (they skip without it).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ env.CRAFT_FONTS_REF }}
+          path: craft-fonts
+          persist-credentials: false
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Install system libraries and Mesa's Vulkan drivers (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
+            mesa-vulkan-drivers libvulkan1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      # Dependencies only (rust-cache drops the workspace's own artifacts).
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: fork-ci
+      - name: cargo xtask ci
+        run: cargo xtask ci
+      - name: CI report
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f target/ci/summary.md ]; then cat target/ci/summary.md >>"$GITHUB_STEP_SUMMARY"; fi
+      - name: GPU tests on a software adapter
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          LIGHTCRAFT_GPU_ALLOW_SOFTWARE: "1"
+        run: |
+          set -o pipefail
+          cargo test -p lightcraft-gpu --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gpu-tests.log"
+          if grep -qE "skipped( \(gpu\))?: no GPU adapter" "$RUNNER_TEMP/gpu-tests.log"; then
+            echo "::error::the GPU tests skipped: the runner offered no GPU adapter"
+            exit 1
+          fi
+
+  desktop:
+    name: ${{ matrix.name }}
+    needs: resolve
+    if: ${{ inputs.platforms != 'linux' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "macOS arm64 (clippy, test, GPU tests on Metal)", runner: macos-latest }
+          - { name: "Windows x86_64 (clippy, test, GPU tests on WARP)", runner: windows-latest }
+    env:
+      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+      CRAFT_FONTS_REQUIRED: "1"
+    steps:
+      # Check files out as committed: tests compare bytes of fixtures and docs.
+      - name: Keep line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ env.CRAFT_FONTS_REF }}
+          path: craft-fonts
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: fork-ci
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # every failing test binary, not only the first: platform failures tend to come in groups
+      - name: cargo test
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: GPU tests on a software adapter
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          LIGHTCRAFT_GPU_ALLOW_SOFTWARE: "1"
+        run: |
+          set -o pipefail
+          cargo test -p lightcraft-gpu --locked --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gpu-tests.log"
+          if grep -qE "skipped( \(gpu\))?: no GPU adapter" "$RUNNER_TEMP/gpu-tests.log"; then
+            echo "::error::the GPU tests skipped: the runner offered no GPU adapter"
+            exit 1
+          fi
+
+  report:
+    name: Report status
+    needs: [resolve, linux, desktop]
+    if: ${{ always() && needs.resolve.outputs.sha != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - name: Post commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          RESULTS: ${{ needs.linux.result }} ${{ needs.desktop.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case " $RESULTS " in
+            *" failure "*) state=failure desc="failed" ;;
+            *" cancelled "*) state=error desc="cancelled" ;;
+            *) state=success desc="passed" ;;
+          esac
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=$state -f context=fork-ci \
+            -f description="$desc ($RESULTS)" -f target_url="$RUN_URL" >/dev/null
