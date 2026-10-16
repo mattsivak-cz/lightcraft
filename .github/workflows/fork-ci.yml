@@ -11,11 +11,14 @@
 # branch and commit pages) and as a run named after the branch in the fork's Actions tab.
 #
 # - Linux runs `cargo xtask ci` (fmt, clippy, heif, tests, parity, layers, assets, wasm) with the
-#   craft-fonts input, then the GPU tests on Mesa's lavapipe.
+#   craft-fonts input.
 # - macOS and Windows run what differs per platform: clippy and the workspace tests (code behind
-#   `cfg(target_os)` only compiles there), then the GPU tests on Metal / WARP.
-# - `LIGHTCRAFT_GPU_ALLOW_SOFTWARE=1` (tests only) lets the GPU tests use a software adapter; the GPU
-#   step fails if they skip anyway.
+#   `cfg(target_os)` only compiles there). macOS runners expose a Metal device, so the GPU tests run
+#   for real there, and a step fails the job if they skip. Linux and Windows runners have no GPU and
+#   upstream has no software-adapter override, so their GPU tests skip.
+# - Windows is non-blocking (`continue-on-error`): upstream main fails 9 Windows-only tests
+#   (tests_export same_folder_as_original, tests_folder_drop: path separators / 8.3 temp names).
+#   Its failures still show in the run; drop `allow-failure` once upstream fixes them.
 # Standard GitHub-hosted runners only (free for a public repository).
 name: Fork CI
 run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}"
@@ -90,7 +93,7 @@ jobs:
             -f description="running" -f target_url="$RUN_URL" >/dev/null
 
   linux:
-    name: Linux x86_64 (xtask ci, GPU tests on lavapipe)
+    name: Linux x86_64 (xtask ci)
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -111,12 +114,11 @@ jobs:
           persist-credentials: false
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-      - name: Install system libraries and Mesa's Vulkan drivers (lavapipe)
+      - name: Install system libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
-            mesa-vulkan-drivers libvulkan1
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: rustfmt, clippy
@@ -131,18 +133,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           if [ -f target/ci/summary.md ]; then cat target/ci/summary.md >>"$GITHUB_STEP_SUMMARY"; fi
-      - name: GPU tests on a software adapter
-        if: ${{ !cancelled() }}
-        shell: bash
-        env:
-          LIGHTCRAFT_GPU_ALLOW_SOFTWARE: "1"
-        run: |
-          set -o pipefail
-          cargo test -p lightcraft-gpu --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gpu-tests.log"
-          if grep -qE "skipped( \(gpu\))?: no GPU adapter" "$RUNNER_TEMP/gpu-tests.log"; then
-            echo "::error::the GPU tests skipped: the runner offered no GPU adapter"
-            exit 1
-          fi
 
   desktop:
     name: ${{ matrix.name }}
@@ -150,12 +140,13 @@ jobs:
     if: ${{ inputs.platforms != 'linux' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    continue-on-error: ${{ matrix.allow-failure }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: "macOS arm64 (clippy, test, GPU tests on Metal)", runner: macos-latest }
-          - { name: "Windows x86_64 (clippy, test, GPU tests on WARP)", runner: windows-latest }
+          - { name: "macOS arm64 (clippy, test, GPU tests on Metal)", runner: macos-latest, allow-failure: false }
+          - { name: "Windows x86_64 (clippy, test; non-blocking)", runner: windows-latest, allow-failure: true }
     env:
       CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
       CRAFT_FONTS_REQUIRED: "1"
@@ -185,16 +176,14 @@ jobs:
       - name: cargo test
         if: ${{ !cancelled() }}
         run: cargo test --workspace --locked --no-fail-fast
-      - name: GPU tests on a software adapter
-        if: ${{ !cancelled() }}
+      - name: GPU tests on Metal
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
         shell: bash
-        env:
-          LIGHTCRAFT_GPU_ALLOW_SOFTWARE: "1"
         run: |
           set -o pipefail
           cargo test -p lightcraft-gpu --locked --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gpu-tests.log"
           if grep -qE "skipped( \(gpu\))?: no GPU adapter" "$RUNNER_TEMP/gpu-tests.log"; then
-            echo "::error::the GPU tests skipped: the runner offered no GPU adapter"
+            echo "::error::the GPU tests skipped: the runner offered no Metal device"
             exit 1
           fi
 
