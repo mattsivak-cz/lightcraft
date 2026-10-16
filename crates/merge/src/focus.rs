@@ -45,9 +45,8 @@ use crate::align::{self, Alignment};
 use crate::features::Features;
 use crate::frame::{Frame, FrameColor};
 use crate::pano::blend::{Buf, down_into, sub_up, up};
-use crate::ransac::Model;
+use crate::refine;
 use crate::{MergeError, Progress, Result, check};
-use crate::{flow, refine};
 
 /// Gaussian window (pixels of each pyramid level) over which a band's energy is summed. 1 leaves
 /// halos beside edges; 3 to 12 measure alike on the synthetic bracket (`tests/focus.rs`).
@@ -131,6 +130,8 @@ struct Small {
     /// Linear luminance, ≤ [`THUMB_EDGE`] px, and the frame's clipping level.
     thumb: Plane,
     clip: f32,
+    /// Brings the frame's median luminance to 0.18 (for matching at full size, [`refine::luma`]).
+    gain: f32,
 }
 
 fn no_pixels(i: usize) -> MergeError {
@@ -155,7 +156,7 @@ pub fn stack_focus(n: usize, load: &Loader, opts: &FocusOptions, progress: &Prog
         // features are found on the work image, so its size is the small frame's (a loader may hand over more than
         // WORK_EDGE pixels)
         let (p, _) = align::work_image(&f.image, gain, align::WORK_EDGE);
-        let thumb = fit(&f.image, THUMB_EDGE, THUMB_EDGE, Filter::Box).map(|c| 0.25 * c[0] + 0.6 * c[1] + 0.15 * c[2]);
+        let thumb = fit(&f.image, THUMB_EDGE, THUMB_EDGE, Filter::Box).map(align::luma);
         let k = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         check(progress, 0.25 * k as f32 / n as f32, "Aligning")?;
         Ok(Small {
@@ -165,6 +166,7 @@ pub fn stack_focus(n: usize, load: &Loader, opts: &FocusOptions, progress: &Prog
             exposure: f.exposure.filter(|e| e.is_finite()),
             thumb,
             clip: f.clip,
+            gain,
         })
     };
     // a few at a time: reading a raw takes the whole sensor's samples, binned or not
@@ -184,15 +186,7 @@ pub fn stack_focus(n: usize, load: &Loader, opts: &FocusOptions, progress: &Prog
         let pair = |j: usize, i: usize| {
             // a similarity only: a homography fitted to features crowded into the sharp slice of
             // the scene extrapolates badly to the corners
-            let a = align::align_pair_with(
-                &[(Model::Similarity, "similarity", 8)],
-                &small[j].features,
-                &small[i].features,
-                1.0,
-                sw,
-                sh,
-                (j * n + i) as u64,
-            );
+            let a = align::align_pair_with(&refine::SIMILARITY, &small[j].features, &small[i].features, 1.0, sw, sh, (j * n + i) as u64);
             (a.model != "identity").then_some((j, a))
         };
         let steps: Vec<Option<(usize, Alignment)>> = (1..n).into_par_iter().map(|i| pair(i - 1, i)).collect();
@@ -271,12 +265,13 @@ pub fn stack_focus(n: usize, load: &Loader, opts: &FocusOptions, progress: &Prog
     let below: Vec<usize> = used.iter().rev().copied().filter(|&i| i < reference).collect();
     let above: Vec<usize> = used.iter().copied().filter(|&i| i > reference).collect();
     let order: Vec<usize> = std::iter::once(reference).chain(below.iter().copied()).chain(above.iter().copied()).collect();
-    // the reference's luminance (for the frames above it) and the last frame's, both in the reference's geometry
+    // the reference's luminance, and the last frame's with its alignment (reference → that frame): what the next
+    // frame is refined against, each in its own geometry
     let mut ref_luma: Option<Plane> = None;
-    let mut prev: Option<Plane> = None;
+    let mut prev: Option<(Plane, Homography)> = None;
     for (k, &i) in order.iter().enumerate() {
         if above.first() == Some(&i) {
-            prev = ref_luma.take();
+            prev = None;
         }
         let mut f = load(i, if i == reference { Load::Reference } else { Load::Stack })?;
         let (w, h) = (f.width(), f.height());
@@ -301,22 +296,27 @@ pub fn stack_focus(n: usize, load: &Loader, opts: &FocusOptions, progress: &Prog
         alignments[i] = Alignment { h: hfull, model, inliers, rms };
         let gain = (-ev[i] * std::f64::consts::LN_2).exp().clamp(1.0 / 16.0, 16.0) as f32;
         if opts.align {
-            let l = refine::luma(&f.image, 0.18 / align::median_luma(&f.image, f.clip).max(1e-6), f.clip);
-            if let Some(p) = &prev
-                && i != reference
-            {
-                let start = Alignment { model: "similarity", ..alignments[i].clone() };
-                let r = refine::refine_with(p, &l, &start, refine::radius_for(scale).min(REFINE_RADIUS), (i + 1) as u64, &refine::SIMILARITY);
-                if r.inliers > 0 && r.h != start.h {
-                    hfull = r.h;
-                    alignments[i] = Alignment { h: r.h, model: r.model, inliers: r.inliers, rms: r.rms };
+            let l = refine::luma(&f.image, small[i].gain, f.clip);
+            if i == reference {
+                ref_luma = Some(l);
+            } else {
+                // against the neighbour (the reference for the first frame on each side): its pixels map to this frame's
+                // through hfull · h_neighbour⁻¹, and the fit composed with h_neighbour is this frame's alignment
+                let neighbour = prev.as_ref().map(|(p, h)| (p, *h)).or_else(|| ref_luma.as_ref().map(|p| (p, Homography::IDENTITY)));
+                if let Some((p, hn)) = neighbour
+                    && let Some(hn_inv) = hn.inverse()
+                    && let Some(r) =
+                        refine::fit(p, &l, &hfull.mul(&hn_inv), refine::radius_for(scale).min(REFINE_RADIUS), (i + 1) as u64, &refine::SIMILARITY)
+                {
+                    hfull = r.h.mul(&hn);
+                    alignments[i] = Alignment { h: hfull, ..r };
+                }
+                prev = Some((l, hfull));
+                // the reference is the neighbour of the first frame on each side only: free it after its last use
+                if above.first() == Some(&i) || (above.is_empty() && below.first() == Some(&i)) {
+                    ref_luma = None;
                 }
             }
-            let warped = if i == reference { l } else { flow::warp_plane(&l, &hfull) };
-            if i == reference && !above.is_empty() {
-                ref_luma = Some(warped.clone());
-            }
-            prev = Some(warped);
         }
         fu.fill(&f.image, (i != reference).then_some(&hfull), gain);
         // only the reference's colour and metadata are kept, never its pixels
