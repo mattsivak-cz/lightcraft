@@ -31,9 +31,9 @@ impl RawImage {
         (0..cfa.height).all(|j| (0..cfa.width).all(|i| block_layout(cfa, i, j, k).1.iter().all(|&n| n > 0)))
     }
 
-    /// Like [`RawImage::develop`] at `1/k` of the size (camera RGB, white = 1.0, default crop applied,
-    /// not oriented). `None` when the data cannot be binned ([`RawImage::can_bin`]) or carries an
-    /// `OpcodeList3` (whose operations are defined at full resolution); callers then demosaic.
+    /// Like [`RawImage::develop`] at `1/k` of the size (camera RGB, white = 1.0, `OpcodeList3` and the default crop
+    /// applied, not oriented). `None` when the data cannot be binned ([`RawImage::can_bin`]) or its `OpcodeList3`
+    /// holds an operation that needs every pixel ([`crate::opcodes::Opcode::binned`]); callers then demosaic.
     pub fn develop_binned(&self, k: usize, clip: f32) -> Result<Option<Rgb32f>> {
         Ok(self.bin(k, clip, true)?.map(|(img, _)| img))
     }
@@ -49,14 +49,19 @@ impl RawImage {
     /// block's maximum sample of the colour instead of the mean.
     fn bin(&self, k: usize, clip: f32, keep_max: bool) -> Result<Option<(Rgb32f, Vec<u8>)>> {
         self.validate()?;
-        if !self.can_bin(k) || !self.opcodes.list3.is_empty() {
+        if !self.can_bin(k) {
             return Ok(None);
         }
+        // `OpcodeList3` (lens shading as a gain map, lens corrections) works on the demosaiced active area: its
+        // operations re-expressed for the binned image, or a full-size develop when one needs every pixel
+        let Some(list3) = self.opcodes.list3.iter().map(|op| op.binned(k)).collect::<Option<Vec<_>>>() else { return Ok(None) };
         let Some(cfa) = &self.cfa else { return Ok(None) };
         let a = self.active_area;
-        // bin the default crop (relative to the active area) only
-        let c = self.crop.clipped(a.width, a.height);
-        let c = if c.width < k || c.height < k { crate::Rect::new(0, 0, a.width, a.height) } else { c };
+        let whole = crate::Rect::new(0, 0, a.width, a.height);
+        let crop = self.crop.clipped(a.width, a.height);
+        let crop = if crop.width < k || crop.height < k { whole } else { crop };
+        // bin the default crop (relative to the active area) only, or all of it for `OpcodeList3` (cropped after)
+        let c = if list3.is_empty() { crop } else { whole };
         let (bw, bh) = (c.width / k, c.height / k);
         if bw == 0 || bh == 0 {
             return Ok(None);
@@ -122,7 +127,18 @@ impl RawImage {
                 }
             }
         });
-        Ok(Some((out, mask)))
+        if list3.is_empty() {
+            return Ok(Some((out, mask)));
+        }
+        crate::opcodes::apply_list3(&list3, &mut out);
+        // the default crop at the binned scale
+        let (x0, y0) = ((crop.x / k).min(bw - 1), (crop.y / k).min(bh - 1));
+        let (cw, ch) = ((crop.width / k).clamp(1, bw - x0), (crop.height / k).clamp(1, bh - y0));
+        if (x0, y0, cw, ch) == (0, 0, bw, bh) {
+            return Ok(Some((out, mask)));
+        }
+        let mask = (y0..y0 + ch).flat_map(|y| mask[y * bw + x0..y * bw + x0 + cw].iter().copied()).collect();
+        Ok(Some((out.into_crop(x0, y0, cw, ch), mask)))
     }
 }
 
