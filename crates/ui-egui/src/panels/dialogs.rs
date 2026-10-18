@@ -73,7 +73,8 @@ fn watermark_preview(
     let t = Tokens::get(ui.ctx());
     let Some(&id) = app.session.selected().first() else { return };
     let Some(photo) = app.session.catalog.photo(id).cloned() else { return };
-    let canvas = app.session.canvas_size(id).unwrap_or((photo.width, photo.height));
+    // (drawn every frame: a whole picture's size not known yet is read in the background)
+    let canvas = app.session.canvas_size_soon(id).unwrap_or((photo.width, photo.height));
     let (out_w, out_h) =
         lightcraft_engine::export::output_size_from(&photo, canvas, &lightcraft_engine::export::ExportOptions { resize, ..Default::default() });
     let export_short = out_w.min(out_h);

@@ -345,3 +345,63 @@ fn a_decode_from_before_full_image_is_not_kept() {
     assert_eq!((full.width, full.height), (100, 60));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Show Full Image is refused for a photo that has no picture past its crop (a PNG), and its crop is kept (PR #2030
+/// review); turning it off is still allowed.
+#[test]
+fn full_image_is_refused_for_a_rendered_photo() {
+    let dir = temp_dir("full-png");
+    let img = lightcraft_raster::Rgba8::from_fn(64, 48, |x, y| [x as u8 * 3, y as u8 * 4, 90, 255]);
+    let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+    let path = dir.join("flat.png");
+    std::fs::write(&path, png).unwrap();
+    let mut s = Session::new().with_fs();
+    let id = lightcraft_catalog::PhotoId(import(&mut s, vec![path.to_string_lossy().to_string()])[0]);
+    s.selection = crate::Selection::single(id);
+    s.execute("develop.set", &json!({"control": "crop.angle", "value": 5.0})).unwrap();
+    let before = s.develop_of(id).unwrap().crop;
+    assert!(!before.geometry.is_identity());
+    let e = s.execute("crop.fullFrame", &json!({"on": true})).unwrap_err().to_string();
+    assert!(e.contains("raw"), "{e}");
+    assert_eq!(s.develop_of(id).unwrap().crop, before, "the crop is untouched");
+    assert!(s.execute("crop.fullFrame", &json!({})).is_err(), "a toggle from off is turning it on");
+    s.execute("crop.fullFrame", &json!({"on": false})).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The UI's whole-picture size never reads the file on the calling thread: the first ask gives the default crop's size
+/// and reads the headers in the background, with a row in the activity stack; once read, the size is the whole
+/// picture's (PR #2030 review).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_ui_reads_the_whole_pictures_size_in_the_background() {
+    let (dir, mut s, id) = dng_with_default_crop("full-probe");
+    s.execute("crop.fullFrame", &json!({"on": true})).unwrap();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let wait = std::sync::Mutex::new(wait);
+    s.media.file_bytes = Some(std::sync::Arc::new(move |path: &str| {
+        // held until the test lets go (or a few seconds, so a read on the calling thread fails the test, not hangs it)
+        let _ = wait.lock().unwrap().recv_timeout(std::time::Duration::from_secs(3));
+        std::fs::read(path).map_err(|e| e.to_string())
+    }));
+    let started = std::time::Instant::now();
+    assert_eq!(s.canvas_size_soon(id), Some((40, 40)), "not read yet: the default crop's size");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "the file was read on the calling thread");
+    assert_eq!(s.canvas_size_soon(id), Some((40, 40)), "asking again doesn't start a second read");
+    let rows: Vec<_> = s.activity.list().into_iter().filter(|t| t.kind == "probe").collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(!rows[0].cancellable);
+    release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while s.canvas_size_soon(id) != Some((100, 60)) {
+        assert!(std::time::Instant::now() < deadline, "the size never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    while s.activity.list().iter().any(|t| t.kind == "probe") {
+        assert!(std::time::Instant::now() < deadline, "the row stayed");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // the export's synchronous size finds it too
+    assert_eq!(s.canvas_size(id), Some((100, 60)));
+    let _ = std::fs::remove_dir_all(&dir);
+}

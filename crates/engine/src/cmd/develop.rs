@@ -730,6 +730,10 @@ pub fn specs() -> Vec<CommandSpec> {
                 let id = active(s, "crop.fullFrame")?;
                 let now = s.develop_of(id).is_some_and(|d| d.crop.full_frame);
                 let on = p.get("on").and_then(Value::as_bool).unwrap_or(!now);
+                // only a raw has a picture past its default crop (turning it off is always allowed)
+                if on && !s.catalog.photo(id).is_some_and(|p| p.kind == lightcraft_catalog::MediaKind::Raw) {
+                    return Err(bad("crop.fullFrame", "Show Full Image is for raw photos: this photo has no picture past its crop"));
+                }
                 edit(s, "crop.fullFrame", if on { "Show Full Image" } else { "Show Default Crop" }, |d| {
                     // the rectangle was relative to the other picture
                     if d.crop.full_frame != on {

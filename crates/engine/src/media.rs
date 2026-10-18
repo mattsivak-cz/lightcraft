@@ -352,13 +352,44 @@ impl SourceRef {
     }
 }
 
+/// Whole-picture sizes of "Show Full Image" photos, by photo, with the [`content_key`] each was read for.
+#[derive(Default)]
+pub(crate) struct CanvasSizes {
+    known: HashMap<PhotoId, (String, (u32, u32))>,
+    /// Background reads in flight ([`crate::Session::canvas_size_soon`]), so a file is read once at a time.
+    reading: std::collections::HashSet<(PhotoId, String)>,
+}
+
+fn lock_sizes(m: &std::sync::Mutex<CanvasSizes>) -> std::sync::MutexGuard<'_, CanvasSizes> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The whole picture's size of the raw at `path`, read with `read` (the host's reader) or from the file system.
+fn read_full_frame_size(read: Option<&crate::merge::ByteReader>, path: &str) -> Result<(u32, u32), String> {
+    let bytes = match read {
+        Some(read) => read(path),
+        None => std::fs::read(path).map_err(|e| format!("{path}: {e}")),
+    }?;
+    crate::files::full_frame_size(&bytes)
+}
+
+/// What [`crate::Session::canvas_size`] needs for a photo.
+enum CanvasPlan {
+    /// The size is known (the catalog's, or the whole picture's read before).
+    Known((u32, u32)),
+    /// The whole picture's size is to be read from the file at `path`, whose content is `key`; `listed` is the
+    /// catalog's size meanwhile.
+    Read { listed: (u32, u32), path: String, key: String },
+}
+
 pub struct MediaCache {
     /// Decodes a raw's whole picture, ignoring its default crop (photos with "Show Full Image" on); `None` where the
     /// host has none (they then show the default crop).
     pub full_frame_loader: Option<FileLoader>,
     /// The size of each "Show Full Image" photo's whole picture (oriented), with the [`content_key`] of the file it
-    /// was read from (see [`crate::Session::canvas_size`]).
-    pub(crate) canvas_sizes: HashMap<PhotoId, (String, (u32, u32))>,
+    /// was read from (see [`crate::Session::canvas_size`]); shared with the background reads of
+    /// [`crate::Session::canvas_size_soon`].
+    pub(crate) canvas_sizes: Arc<std::sync::Mutex<CanvasSizes>>,
     settings_hashes: SettingsHashes,
     /// Decoded thumbnail-level sources (LRU by bytes).
     thumbs: Lru<PhotoId, DecodedSource>,
@@ -446,7 +477,7 @@ impl Default for MediaCache {
         let budget = crate::memory::cache_share(crate::memory::budget());
         MediaCache {
             full_frame_loader: None,
-            canvas_sizes: HashMap::new(),
+            canvas_sizes: Default::default(),
             settings_hashes: SettingsHashes::default(),
             thumbs: Lru::new(THUMB_SOURCE_BYTES.min(budget)),
             previews: Vec::new(),
@@ -1679,33 +1710,73 @@ impl crate::Session {
     /// The size (oriented) of the picture photo `id` is developed from, before its crop: the catalog's size, except
     /// with "Show Full Image" on, where it is the raw's whole picture past its default crop (read from the file's
     /// headers once per file content). Export plans its native size from this. A file that can't be read gives the
-    /// catalog's size (the render then says what is wrong). `None`: no such photo.
+    /// catalog's size (the render then says what is wrong). `None`: no such photo. A size not known yet is read here,
+    /// on the calling thread: the UI uses [`Self::canvas_size_soon`].
     pub fn canvas_size(&mut self, id: PhotoId) -> Option<(u32, u32)> {
-        let p = self.catalog.photo(id)?;
-        let listed = (p.width, p.height);
-        let Source::File { path } = &p.source else { return Some(listed) };
-        if !self.media.shows_full_frame(p) {
-            return Some(listed);
-        }
-        let key = content_key(p);
-        if let Some((k, size)) = self.media.canvas_sizes.get(&id)
-            && *k == key
-        {
-            return Some(*size);
-        }
-        let bytes = match &self.media.file_bytes {
-            Some(read) => read(path),
-            None => std::fs::read(path).map_err(|e| format!("{path}: {e}")),
+        let (listed, path, key) = match self.canvas_plan(id)? {
+            CanvasPlan::Known(size) => return Some(size),
+            CanvasPlan::Read { listed, path, key } => (listed, path, key),
         };
-        let size = match bytes.and_then(|b| crate::files::full_frame_size(&b)) {
-            Ok(size) => size,
+        match read_full_frame_size(self.media.file_bytes.as_ref(), &path) {
+            Ok(size) => {
+                lock_sizes(&self.media.canvas_sizes).known.insert(id, (key, size));
+                Some(size)
+            }
             Err(e) => {
                 log::warn!("photo {}: whole picture size not read: {e}", id.0);
-                return Some(listed);
+                Some(listed)
             }
+        }
+    }
+
+    /// [`Self::canvas_size`] for the UI thread, which must not wait for a file: a size not known yet is read from the
+    /// file's headers in the background (a row in the activity stack while it runs), and until it is known this
+    /// gives the catalog's size. A read that fails is tried again on the next ask.
+    pub fn canvas_size_soon(&mut self, id: PhotoId) -> Option<(u32, u32)> {
+        let (listed, path, key) = match self.canvas_plan(id)? {
+            CanvasPlan::Known(size) => return Some(size),
+            CanvasPlan::Read { listed, path, key } => (listed, path, key),
         };
-        self.media.canvas_sizes.insert(id, (key, size));
-        Some(size)
+        // the web build has no threads (and reads its files from memory)
+        if cfg!(target_arch = "wasm32") {
+            return self.canvas_size(id);
+        }
+        let sizes = self.media.canvas_sizes.clone();
+        if !lock_sizes(&sizes).reading.insert((id, key.clone())) {
+            return Some(listed);
+        }
+        let read = self.media.file_bytes.clone();
+        let task = self.activity.start("probe", "Reading picture size", crate::activity::Cancel::No);
+        std::thread::spawn(move || {
+            let _task = task;
+            let size = crate::guard::catch("reading the picture size", || read_full_frame_size(read.as_ref(), &path)).and_then(|r| r);
+            let mut sizes = lock_sizes(&sizes);
+            sizes.reading.remove(&(id, key.clone()));
+            match size {
+                Ok(size) => {
+                    sizes.known.insert(id, (key, size));
+                }
+                Err(e) => log::warn!("photo {}: whole picture size not read: {e}", id.0),
+            }
+        });
+        Some(listed)
+    }
+
+    /// What [`Self::canvas_size`] needs for photo `id`. `None`: no such photo.
+    fn canvas_plan(&self, id: PhotoId) -> Option<CanvasPlan> {
+        let p = self.catalog.photo(id)?;
+        let listed = (p.width, p.height);
+        let Source::File { path } = &p.source else { return Some(CanvasPlan::Known(listed)) };
+        if !self.media.shows_full_frame(p) {
+            return Some(CanvasPlan::Known(listed));
+        }
+        let key = content_key(p);
+        if let Some((k, size)) = lock_sizes(&self.media.canvas_sizes).known.get(&id)
+            && *k == key
+        {
+            return Some(CanvasPlan::Known(*size));
+        }
+        Some(CanvasPlan::Read { listed, path: path.clone(), key })
     }
 
     /// Synchronous render (CLI, MCP, tests).
@@ -1756,6 +1827,13 @@ impl crate::Session {
         // background queue has not got to it. (A source kept in memory may lack the picture, so the job reads the file.)
         if let Some(wanted) = self.denoise_for_export(id, &job.settings)? {
             let p = self.catalog.photo(id).ok_or("no such photo")?.clone();
+            // the denoised picture is made for the default crop: scaled to the whole picture it would be the wrong one
+            if self.media.shows_full_frame(&p) {
+                return Err(format!(
+                    "{}: AI Denoise can't be exported with Show Full Image yet; turn off Show Full Image, or set Denoise to 0",
+                    p.file_name
+                ));
+            }
             job.source = self.media.source_ref_uncached(&p, job.level);
             if let SourceRef::File { denoise, .. } = &mut job.source {
                 *denoise = Some(wanted);
