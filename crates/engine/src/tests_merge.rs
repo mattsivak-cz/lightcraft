@@ -276,10 +276,15 @@ fn a_changed_preview_reuses_its_decoded_photos() {
     assert_eq!(s.media.merge_frames.len(), 3);
     s.execute("merge.hdr", &json!({"ids": ids, "preview": true, "deghost": "high"})).unwrap();
     assert_eq!(count(), 3, "the second preview read its photos again");
-    // the full-size merge doesn't use (or fill) the preview cache
+    // the full-size merge doesn't use (or fill) the preview cache, and releases it: the memory is the stitch's
     s.execute("merge.hdr", &json!({"ids": ids, "autoSettings": false})).unwrap();
     assert_eq!(count(), 6);
+    assert_eq!(s.media.merge_frames.len(), 0, "a full-size merge kept the preview photos");
+    // forgetting the decoded sources (another library) forgets the preview photos too
+    s.execute("merge.hdr", &json!({"ids": ids, "preview": true})).unwrap();
     assert_eq!(s.media.merge_frames.len(), 3);
+    s.media.clear_sources();
+    assert_eq!(s.media.merge_frames.len(), 0, "clear_sources kept the preview photos");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
