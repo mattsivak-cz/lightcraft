@@ -247,6 +247,16 @@
 
 ## 2026-10-18
 
+### Messages stay out of the way, and the bell keeps them
+- An import whose Lightroom XMP settings couldn't all be applied says so in one line ("Lightroom settings not
+  applied: 48") instead of covering the photos with every file and setting. **Show Details** lists the photos by
+  setting, each folder once, with Copy to Clipboard. No message is taller than four lines now, and one stays while the
+  pointer rests on it.
+- The list under the bell keeps the recent messages below the running tasks, so a message that faded can still be
+  read; a dot on the bell says new ones came.
+- With the menus in the window (Windows, Linux, the browser), the search field moves right when it would squeeze out
+  a menu title.
+
 ### Thumbnails of Lightroom HDR and panorama merges in a second
 - Grid and filmstrip thumbnails of DNGs that Lightroom merged (HDR, Panorama, HDR Panorama) now develop from the
   small copies of the raw image Lightroom keeps inside the file (256 to 2048 px), not from the whole merge. A 23836 ×

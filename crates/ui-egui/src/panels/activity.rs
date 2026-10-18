@@ -4,6 +4,10 @@
 //! what it is working on, and ✕ for the ones that can be cancelled. Nothing floats over the panels, so the list
 //! covers them only while it is open. The tasks come from the engine's registry
 //! ([`lightcraft_engine::activity`]); ✕ runs `activity.cancel` like any other frontend would.
+//!
+//! Under the tasks the list keeps the recent notifications ([`crate::notifications`]): how a job ended, an error that
+//! was only a toast, with Show Details for those that carry a report. A dot on the bell says new ones came in since
+//! the list was last open.
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
@@ -14,6 +18,7 @@ use serde_json::json;
 use crate::LightcraftApp;
 use crate::i18n::{tr, tr_format};
 use crate::icons::{Icon, paint};
+use crate::notifications::Notifications;
 use crate::theme::Tokens;
 use crate::widgets::register;
 
@@ -151,11 +156,15 @@ pub fn bell(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, icon: Rect, 
     let chip = if has_readout { Rect::from_min_max(pos2(icon.left() - READOUT_GAP - line_w, icon.top()), icon.max) } else { icon };
     let was_open = is_open(&ctx);
     let resp = ui.interact(chip, egui::Id::unique(("top", "bell")), Sense::click());
-    let label = match tasks.len() {
+    let mut label = match tasks.len() {
         0 => tr("Tasks").to_string(),
         1 => format!("{}: {text}", tr("Tasks")),
         _ => text,
     };
+    let unread = app.notifications.unread;
+    if unread > 0 && !was_open {
+        label = format!("{label} · {}: {unread}", tr("New notifications"));
+    }
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, was_open, label.as_str()));
     register(ui, "icon:bell", icon);
     let p = ui.painter();
@@ -191,6 +200,14 @@ pub fn bell(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, icon: Rect, 
             register(ui, "activity:count", Rect::from_center_size(c, vec2(13.0, 13.0)));
         }
     }
+    if unread > 0 && !was_open {
+        // notifications came in: a dot at the bell's other shoulder (the count, when there is one, has the right),
+        // in the caution colour if one of them is a warning
+        let c = icon.center() + vec2(-11.0, -10.0);
+        p.circle_filled(c, 4.5, t.chrome);
+        p.circle_filled(c, 3.5, if app.notifications.unread_warning { t.caution } else { progress_ink(t) });
+        register(ui, "indicator:unread", Rect::from_center_size(c, vec2(9.0, 9.0)));
+    }
     // a dialog, a notice or the question before quitting takes the window: the list gives way to it
     let asked = app.activity_set.take();
     let set = if blocked(app).is_some() {
@@ -202,18 +219,41 @@ pub fn bell(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, icon: Rect, 
         resp.clicked().then_some(egui::SetOpenCommand::Toggle)
     };
     let resp = if was_open { resp } else { resp.on_hover_text(label.as_str()) };
-    let mut cancel = None;
+    let mut action = None;
+    let now = app.tick_now();
+    let notes = &app.notifications;
     egui::Popup::from_response(&resp)
         .id(popup_id())
         .open_memory(set)
         .align(egui::RectAlign::BOTTOM_END)
         .gap(6.0)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show(|ui| cancel = list(ui, t, &all));
+        .show(|ui| action = list(ui, t, &all, notes, now));
     app.activity_open = is_open(&ctx);
-    if let Some(id) = cancel {
-        self::cancel(app, id);
+    if app.activity_open {
+        // what the list shows has been seen
+        app.notifications.mark_read();
     }
+    match action {
+        Some(Action::Cancel(id)) => self::cancel(app, id),
+        Some(Action::Clear) => app.notifications.clear(),
+        // the report is a dialog: the list makes way for it
+        Some(Action::Details(id)) if app.show_report(id) => {
+            egui::Popup::close_id(&ctx, popup_id());
+            app.activity_open = false;
+        }
+        Some(Action::Details(_)) | None => {}
+    }
+}
+
+/// What a click in the list asks for.
+enum Action {
+    /// ✕ on a task's row.
+    Cancel(u64),
+    /// Show Details on a notification: open its report.
+    Details(u64),
+    /// Clear the notifications.
+    Clear,
 }
 
 /// Why the list can't be shown now, if it can't: something else has the window, or the top bar isn't drawn.
@@ -277,16 +317,28 @@ fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-/// The list under the bell: its name, then a row a task (or that nothing runs). The id of the task whose ✕ was
-/// clicked.
-fn list(ui: &mut egui::Ui, t: &Tokens, tasks: &[TaskInfo]) -> Option<u64> {
+/// The list's width in a window `screen_w` points wide: [`WIDTH`] where there is room, else what the window leaves
+/// beside a margin, never below a usable minimum (egui keeps the popup on screen, so this only has to stay finite
+/// and positive, never be ordered against the window's edges).
+pub fn list_width(screen_w: f32) -> f32 {
+    let w = if screen_w.is_finite() { screen_w - 40.0 } else { WIDTH };
+    WIDTH.min(w).max(160.0)
+}
+
+/// The list under the bell: its name, then a row a task (or that nothing runs), then the recent notifications. What
+/// a click in it asks for.
+fn list(ui: &mut egui::Ui, t: &Tokens, tasks: &[TaskInfo], notes: &Notifications, now: f64) -> Option<Action> {
     let screen = ui.ctx().content_rect();
-    let width = WIDTH.min(screen.width() - 40.0).max(160.0);
-    let mut cancel = None;
+    let width = list_width(screen.width());
+    let mut action = None;
     // A popup lays out in the size it had last frame, and the scroll area would take that as all the room there is:
     // the list would never grow when rows are added. Give it the whole height below the top bar instead (the scroll
-    // area keeps to `max_height`).
-    ui.set_max_height((screen.height() - t.top_bar_h - 16.0).max(80.0));
+    // areas keep to their `max_height`).
+    let room = (screen.height() - t.top_bar_h - 16.0).max(80.0);
+    ui.set_max_height(room);
+    // with notifications to show the tasks take at most half the room, and the notifications what is left
+    let rows_room = (screen.height() - t.top_bar_h - 96.0).max(80.0);
+    let tasks_room = if notes.items.is_empty() { rows_room } else { (rows_room * 0.5).max(80.0) };
     let r = ui
         .vertical(|ui| {
             ui.set_width(width);
@@ -302,24 +354,88 @@ fn list(ui: &mut egui::Ui, t: &Tokens, tasks: &[TaskInfo]) -> Option<u64> {
                     })
                     .response;
                 register(ui, "activity:empty", r.rect);
-                return;
+            } else {
+                // as many rows as the window has room for; the rest scroll
+                egui::ScrollArea::vertical().id_salt("activity-tasks").max_height(tasks_room).auto_shrink([false, true]).show(ui, |ui| {
+                    for (i, task) in tasks.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(8.0);
+                        }
+                        if row(ui, t, task, width) {
+                            action = Some(Action::Cancel(task.id));
+                        }
+                    }
+                });
             }
-            // as many rows as the window has room for; the rest scroll
-            let max_height = (screen.height() - t.top_bar_h - 96.0).max(80.0);
-            egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
-                for (i, task) in tasks.iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(8.0);
-                    }
-                    if row(ui, t, task, width) {
-                        cancel = Some(task.id);
-                    }
-                }
-            });
+            if let Some(a) = notifications(ui, t, notes, now, width, (rows_room - tasks_room).max(100.0)) {
+                action = Some(a);
+            }
         })
         .response;
     register(ui, "activity:list", r.rect);
-    cancel
+    action
+}
+
+/// The recent notifications under the tasks: a heading with Clear, then each one, newest first, with how long ago it
+/// came and Show Details when it has a report.
+fn notifications(ui: &mut egui::Ui, t: &Tokens, notes: &Notifications, now: f64, width: f32, max_height: f32) -> Option<Action> {
+    let mut action = None;
+    ui.add_space(6.0);
+    ui.separator();
+    ui.allocate_ui_with_layout(vec2(width, 18.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.add(egui::Label::new(RichText::new(tr("Notifications")).font(t.semibold(12.5)).color(t.text)));
+        if !notes.items.is_empty() {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let r = ui.add(egui::Label::new(RichText::new(tr("Clear")).font(t.font(11.5)).color(t.accent)).sense(Sense::click()));
+                crate::widgets::announce(&r, tr("Clear"));
+                register(ui, "activity:clear", r.rect);
+                if r.clicked() {
+                    action = Some(Action::Clear);
+                }
+            });
+        }
+    });
+    if notes.items.is_empty() {
+        let r = ui.add(egui::Label::new(RichText::new(tr("Nothing yet")).font(t.font(12.0)).color(t.text_dim)));
+        register(ui, "notifications:empty", r.rect);
+        return action;
+    }
+    egui::ScrollArea::vertical().id_salt("activity-notifications").max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
+        for n in &notes.items {
+            ui.add_space(4.0);
+            let r = ui.vertical(|ui| {
+                ui.set_width(width);
+                ui.horizontal_top(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(vec2(8.0, 16.0), Sense::hover());
+                    ui.painter().circle_filled(pos2(dot.center().x, dot.top() + 8.0), 3.0, if n.warning { t.caution } else { t.text_dim });
+                    // laid out here at the list's width (a label handed a job in a row would lay it out again in
+                    // whatever room the row reports, and could grow the list past the window)
+                    let mut job = egui::text::LayoutJob::simple(n.text.clone(), t.font(12.0), t.text_label, (width - 16.0).max(40.0));
+                    job.wrap.max_rows = 3;
+                    let galley = ui.painter().layout_job(job);
+                    ui.add(egui::Label::new(galley).selectable(true));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.add(egui::Label::new(RichText::new(crate::notifications::age_text(now, n.time)).font(t.font(11.0)).color(t.text_dim)));
+                    if n.report.is_some() {
+                        let r = ui.add(egui::Label::new(RichText::new(tr("Show Details")).font(t.font(11.0)).color(t.accent)).sense(Sense::click()));
+                        crate::widgets::announce(&r, tr("Show Details"));
+                        if ui.is_rect_visible(r.rect) {
+                            register(ui, format!("notification:details:{}", n.id), r.rect);
+                        }
+                        if r.clicked() {
+                            action = Some(Action::Details(n.id));
+                        }
+                    }
+                });
+            });
+            if ui.is_rect_visible(r.response.rect) {
+                register(ui, format!("notification:{}", n.id), r.response.rect);
+            }
+        }
+    });
+    action
 }
 
 /// ✕ on task `id`'s row. The task may have just finished or stopped being cancellable: nothing to tell the user then,
@@ -383,6 +499,17 @@ mod tests {
             let t = Tokens::for_kind(kind);
             let ratio = contrast(progress_ink(&t), t.chrome);
             assert!(ratio >= 3.0, "{}: the ring's arc is {ratio:.2}:1 on the bar", kind.id());
+        }
+    }
+
+    #[test]
+    fn the_list_width_is_positive_and_fits_whatever_the_window() {
+        for w in [0.0, 100.0, 300.0, 320.0, 335.0, 336.0, 900.0, f32::NAN, f32::INFINITY] {
+            let lw = list_width(w);
+            assert!(lw.is_finite() && (160.0..=WIDTH).contains(&lw), "{w}: {lw}");
+            if w.is_finite() && w >= 200.0 {
+                assert!(lw <= w - 40.0, "{w}: {lw} leaves no margin");
+            }
         }
     }
 }

@@ -1,5 +1,6 @@
 //! Issue #345: the activity stack — one place for every long-running task, with ✕ to cancel. It lives under the
 //! bell in the top bar: a ring and a line beside the bell while something runs, the rows in a list a click opens.
+//! Under the rows the list keeps the recent notifications (an import's warnings behind a Show Details report).
 
 use std::time::Duration;
 
@@ -798,4 +799,159 @@ fn immediate_library_commands_and_auto_sync_show_completion() {
     h.app.ui.toast = None;
     assert!(h.app.run("library.compact", json!({})).is_err());
     assert!(h.app.ui.toast.is_none());
+}
+
+fn import_report() -> crate::notifications::Report {
+    crate::notifications::Report {
+        title: "Import Warnings".into(),
+        summary: "Photos with Lightroom settings LightCraft didn't apply: 2".into(),
+        groups: vec![crate::notifications::ReportGroup { heading: "Not imported: Look".into(), items: vec!["/x/a.ARW".into(), "/x/b.ARW".into()] }],
+    }
+}
+
+/// A toast with a report (an import's warnings) is one line and a Show Details link; the link opens the report, and
+/// the list under the bell keeps the notification (a dot on the bell until the list is opened).
+#[test]
+fn a_report_is_behind_the_toasts_details_link_and_in_the_list_under_the_bell() {
+    let mut h = demo();
+    let report = import_report();
+    let ctx = h.view.ctx.clone();
+    h.app.notify(&ctx, "Imported 2 photos · Lightroom settings not applied: 2", true, Some(report.clone()));
+    h.step();
+    h.step();
+    assert!(has(&h, "toast:details"));
+    assert!(has(&h, "indicator:unread"), "a dot on the bell");
+    click(&mut h, "toast:details");
+    assert!(matches!(&h.app.ui.dialog, Some(crate::state::Dialog::Report { report: r }) if *r == report), "{:?}", h.app.ui.dialog);
+    assert!(h.app.ui.toast.is_none(), "the toast goes once its report is open");
+    h.app.ui.dialog = None;
+    // the list keeps it, with the same link
+    open_list(&mut h);
+    assert!(!has(&h, "indicator:unread"), "read once the list is open");
+    assert_eq!(h.app.notifications.unread, 0);
+    let id = h.app.notifications.items[0].id;
+    assert!(has(&h, &format!("notification:{id}")));
+    click(&mut h, &format!("notification:details:{id}"));
+    assert!(matches!(&h.app.ui.dialog, Some(crate::state::Dialog::Report { .. })));
+    assert!(!h.app.activity_open, "the list makes way for the report");
+    let inspect = h.request("ui.inspect", json!({}), T);
+    assert_eq!(inspect["result"]["notifications"][0]["details"], true, "{}", inspect["result"]["notifications"]);
+    assert_eq!(inspect["result"]["unread"], 0);
+}
+
+/// Errors that were only a toast are kept too, and Clear empties the list.
+#[test]
+fn errors_are_kept_in_the_list_and_clear_empties_it() {
+    let mut h = demo();
+    let ctx = h.view.ctx.clone();
+    h.app.toast_error(&ctx, "Couldn't write the sidecar");
+    h.step();
+    assert!(has(&h, "indicator:unread"));
+    open_list(&mut h);
+    let id = h.app.notifications.items[0].id;
+    assert!(has(&h, &format!("notification:{id}")));
+    assert!(!has(&h, &format!("notification:details:{id}")), "no report, no link");
+    click(&mut h, "activity:clear");
+    assert!(h.app.notifications.items.is_empty());
+    assert!(has(&h, "notifications:empty"));
+}
+
+/// However long the message, a toast stays a few lines tall (it used to list every warned photo and cover the grid).
+#[test]
+fn a_long_toast_is_cut_to_a_few_lines() {
+    let mut h = demo();
+    let ctx = h.view.ctx.clone();
+    let long: String = (0..60).map(|i| format!("XMP adjustments were not imported for /Volumes/X/DSC{i:05}.ARW: Look.\n")).collect();
+    h.app.toast(&ctx, long);
+    h.step();
+    h.step();
+    let toast = rect(&h, "toast");
+    let canvas = h.app.canvas_rect.expect("a canvas");
+    assert!(toast.height() < 120.0, "{toast:?}");
+    assert!(toast.height() < canvas.height() / 4.0, "{toast:?} in {canvas:?}");
+}
+
+/// The pointer resting on a toast keeps it from fading (reading it, or on the way to its link).
+#[test]
+fn hovering_a_toast_keeps_it() {
+    let mut h = demo();
+    let ctx = h.view.ctx.clone();
+    h.app.notify(&ctx, "Imported 2 photos · Lightroom settings not applied: 2", true, Some(import_report()));
+    h.step();
+    h.step();
+    let toast = rect(&h, "toast");
+    h.request("ui.move", json!({"x": toast.center().x, "y": toast.center().y}), T);
+    h.step();
+    // its time runs out while the pointer is on it: it stays
+    let now = h.view.ctx.input(|i| i.time);
+    if let Some((_, until, _)) = h.app.ui.toast.as_mut() {
+        *until = now + 0.05;
+    }
+    for _ in 0..20 {
+        h.step();
+    }
+    assert!(h.app.ui.toast.is_some(), "kept while hovered");
+    // and goes once the pointer leaves
+    h.request("ui.move", json!({"x": 1, "y": 1}), T);
+    let now = h.view.ctx.input(|i| i.time);
+    if let Some((_, until, _)) = h.app.ui.toast.as_mut() {
+        *until = now + 0.05;
+    }
+    for _ in 0..20 {
+        h.step();
+    }
+    assert!(h.app.ui.toast.is_none(), "gone once the pointer leaves");
+}
+
+#[test]
+fn import_warnings_are_grouped_by_what_was_not_applied() {
+    use lightcraft_engine::import::{ImportUprightMode, ImportWarning, ImportWarningCode};
+    let w = |path: &str, code, fields: &[&str], mode| ImportWarning {
+        path: path.into(),
+        code,
+        profile: (code == ImportWarningCode::CameraProfile).then(|| "Camera Faithful".into()),
+        mode,
+        fields: fields.iter().map(|f| f.to_string()).collect(),
+    };
+    let warnings = [
+        w("/x/1.ARW", ImportWarningCode::UnmappedXmp, &["Look", "ColorVariance"], None),
+        w("/x/2.ARW", ImportWarningCode::UnmappedXmp, &["Look"], None),
+        w("/x/2.ARW", ImportWarningCode::CameraProfile, &[], None),
+        w("/x/3.ARW", ImportWarningCode::UprightGeometry, &[], Some(ImportUprightMode::Auto)),
+    ];
+    let r = crate::import::warnings_report(&warnings);
+    let groups: Vec<(&str, Vec<&str>)> = r.groups.iter().map(|g| (g.heading.as_str(), g.items.iter().map(String::as_str).collect())).collect();
+    assert_eq!(
+        groups,
+        [
+            ("Not imported: Look", vec!["/x/1.ARW", "/x/2.ARW"]),
+            ("Not imported: ColorVariance", vec!["/x/1.ARW"]),
+            ("Profile not applied, colors may differ from Lightroom: Camera Faithful", vec!["/x/2.ARW"]),
+            ("Upright Auto will be recalculated", vec!["/x/3.ARW"]),
+        ]
+    );
+    assert!(r.summary.contains(": 3."), "three photos: {}", r.summary);
+}
+
+/// #2008's review: a popover placed with `f32::clamp` between the window's edges panicked when the window was
+/// narrower than the popover plus its margins (min > max). The list under the bell is egui's popup, kept on screen by
+/// egui; open it with tasks and notifications at narrow and wide widths, and it stays inside the window.
+#[test]
+fn the_list_opens_inside_a_narrow_window_without_panicking() {
+    for width in [300.0, 320.0, 335.0, 336.0, 900.0] {
+        let mut h = demo_sized([width, 700.0]);
+        let ctx = h.view.ctx.clone();
+        let g = h.app.session.activity.start("export", "Exporting", Cancel::Yes);
+        g.progress(2, 5);
+        h.app.notify(&ctx, "Imported 2 photos · Lightroom settings not applied: 2", true, Some(import_report()));
+        wait_visible(&mut h);
+        open_list(&mut h);
+        let list = rect(&h, "activity:list");
+        let screen = h.view.ctx.content_rect();
+        assert!(list.left() >= screen.left() && list.right() <= screen.right(), "{width}: the list at {list:?} leaves {screen:?}");
+        assert!(has(&h, &format!("activity:row:{}", g.id())), "{width}: the task's row");
+        let id = h.app.notifications.items[0].id;
+        assert!(has(&h, &format!("notification:{id}")), "{width}: the notification");
+        drop(g);
+    }
 }
