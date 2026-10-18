@@ -358,9 +358,15 @@ pub(crate) struct CanvasSizes {
     known: HashMap<PhotoId, (String, (u32, u32))>,
     /// Background reads in flight ([`crate::Session::canvas_size_soon`]), so a file is read once at a time.
     reading: std::collections::HashSet<(PhotoId, String)>,
+    /// Background reads that failed, with when: the same content isn't read again for [`SIZE_RETRY`], so a missing
+    /// file doesn't start a read (and a warning) on every frame that asks.
+    pub(crate) failed: HashMap<(PhotoId, String), web_time::Instant>,
 }
 
-fn lock_sizes(m: &std::sync::Mutex<CanvasSizes>) -> std::sync::MutexGuard<'_, CanvasSizes> {
+/// How long [`crate::Session::canvas_size_soon`] waits before reading a file whose size read failed again.
+pub(crate) const SIZE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub(crate) fn lock_sizes(m: &std::sync::Mutex<CanvasSizes>) -> std::sync::MutexGuard<'_, CanvasSizes> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -1731,7 +1737,8 @@ impl crate::Session {
 
     /// [`Self::canvas_size`] for the UI thread, which must not wait for a file: a size not known yet is read from the
     /// file's headers in the background (a row in the activity stack while it runs), and until it is known this
-    /// gives the catalog's size. A read that fails is tried again on the next ask.
+    /// gives the catalog's size. A read that fails is tried again on an ask [`SIZE_RETRY`] later (the file may come
+    /// back), not on every ask.
     pub fn canvas_size_soon(&mut self, id: PhotoId) -> Option<(u32, u32)> {
         let (listed, path, key) = match self.canvas_plan(id)? {
             CanvasPlan::Known(size) => return Some(size),
@@ -1742,8 +1749,13 @@ impl crate::Session {
             return self.canvas_size(id);
         }
         let sizes = self.media.canvas_sizes.clone();
-        if !lock_sizes(&sizes).reading.insert((id, key.clone())) {
-            return Some(listed);
+        {
+            let mut guard = lock_sizes(&sizes);
+            let probe = (id, key.clone());
+            if guard.failed.get(&probe).is_some_and(|at| at.elapsed() < SIZE_RETRY) || !guard.reading.insert(probe.clone()) {
+                return Some(listed);
+            }
+            guard.failed.remove(&probe);
         }
         let read = self.media.file_bytes.clone();
         let task = self.activity.start("probe", "Reading picture size", crate::activity::Cancel::No);
@@ -1756,7 +1768,10 @@ impl crate::Session {
                 Ok(size) => {
                     sizes.known.insert(id, (key, size));
                 }
-                Err(e) => log::warn!("photo {}: whole picture size not read: {e}", id.0),
+                Err(e) => {
+                    log::warn!("photo {}: whole picture size not read: {e}", id.0);
+                    sizes.failed.insert((id, key), web_time::Instant::now());
+                }
             }
         });
         Some(listed)

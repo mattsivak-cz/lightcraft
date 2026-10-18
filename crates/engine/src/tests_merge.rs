@@ -346,6 +346,36 @@ fn a_decode_from_before_full_image_is_not_kept() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Show Full Image toggled inside an interaction (previewed without an undo step) drops the decoded picture like a
+/// committed toggle does, so a cancelled interaction doesn't keep showing the other picture (PR #2030 review).
+#[test]
+fn a_cancelled_full_image_preview_drops_its_picture() {
+    let (dir, mut s, id) = dng_with_default_crop("full-cancel");
+    let cropped = s.render_now(id, 100, 100).unwrap().image;
+    assert_eq!((cropped.width, cropped.height), (100, 100));
+    let set_full = |s: &mut Session, on: bool| {
+        let mut d = (*s.develop_of(id).unwrap()).clone();
+        d.crop.full_frame = on;
+        s.set_develop(id, d, "Show Full Image").unwrap();
+    };
+    s.begin_interaction("Show Full Image").unwrap();
+    set_full(&mut s, true);
+    let full = s.render_now(id, 100, 100).unwrap().image;
+    assert_eq!((full.width, full.height), (100, 60), "the preview shows the whole picture");
+    s.cancel_interaction().unwrap();
+    let back = s.render_now(id, 100, 100).unwrap().image;
+    assert_eq!((back.width, back.height), (100, 100), "cancelled: the default crop again, not the cached whole picture");
+    // the other way: a preview turning it off, cancelled, shows the whole picture again
+    s.execute("crop.fullFrame", &json!({"on": true})).unwrap();
+    assert_eq!(s.render_now(id, 100, 100).unwrap().image.height, 60);
+    s.begin_interaction("Show Full Image").unwrap();
+    set_full(&mut s, false);
+    assert_eq!(s.render_now(id, 100, 100).unwrap().image.height, 100, "the preview shows the default crop");
+    s.cancel_interaction().unwrap();
+    assert_eq!(s.render_now(id, 100, 100).unwrap().image.height, 60, "cancelled: the whole picture again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Show Full Image is refused for a photo that has no picture past its crop (a PNG), and its crop is kept (PR #2030
 /// review); turning it off is still allowed.
 #[test]
@@ -403,5 +433,44 @@ fn the_ui_reads_the_whole_pictures_size_in_the_background() {
     }
     // the export's synchronous size finds it too
     assert_eq!(s.canvas_size(id), Some((100, 60)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A whole-picture size read that fails isn't started again on every ask (the watermark preview asks every frame):
+/// it waits [`crate::media::SIZE_RETRY`] before reading the file again (PR #2030 review).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_failed_size_read_is_not_retried_on_every_ask() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (dir, mut s, id) = dng_with_default_crop("full-probe-fail");
+    s.execute("crop.fullFrame", &json!({"on": true})).unwrap();
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    s.media.file_bytes = Some(std::sync::Arc::new(move |_: &str| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Err("the drive is offline".to_string())
+    }));
+    let settle = |s: &Session| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.activity.list().iter().any(|t| t.kind == "probe") {
+            assert!(std::time::Instant::now() < deadline, "the read never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    assert_eq!(s.canvas_size_soon(id), Some((40, 40)));
+    settle(&s);
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    for _ in 0..20 {
+        assert_eq!(s.canvas_size_soon(id), Some((40, 40)), "still the default crop's size");
+        settle(&s);
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "a failed read was started again on every ask");
+    // once the retry interval has passed, the file is read again (it may be back)
+    for at in crate::media::lock_sizes(&s.media.canvas_sizes).failed.values_mut() {
+        *at = at.checked_sub(crate::media::SIZE_RETRY).unwrap();
+    }
+    assert_eq!(s.canvas_size_soon(id), Some((40, 40)));
+    settle(&s);
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "never read again");
     let _ = std::fs::remove_dir_all(&dir);
 }

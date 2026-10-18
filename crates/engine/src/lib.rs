@@ -743,9 +743,10 @@ impl Session {
         });
     }
 
-    /// Apply without recording undo (interactive previews).
+    /// Apply without recording undo (interactive previews). The decoded pictures a change makes stale are dropped as
+    /// on commit (a "Show Full Image" toggle decodes another picture).
     fn apply_silent(&mut self, op: Op) -> Result<()> {
-        self.catalog.apply(op)?;
+        self.apply_catalog(op)?;
         Ok(())
     }
 
