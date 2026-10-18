@@ -356,6 +356,9 @@ pub struct MediaCache {
     /// Decodes a raw's whole picture, ignoring its default crop (photos with "Show Full Image" on); `None` where the
     /// host has none (they then show the default crop).
     pub full_frame_loader: Option<FileLoader>,
+    /// The size of each "Show Full Image" photo's whole picture (oriented), with the [`content_key`] of the file it
+    /// was read from (see [`crate::Session::canvas_size`]).
+    pub(crate) canvas_sizes: HashMap<PhotoId, (String, (u32, u32))>,
     settings_hashes: SettingsHashes,
     /// Decoded thumbnail-level sources (LRU by bytes).
     thumbs: Lru<PhotoId, DecodedSource>,
@@ -443,6 +446,7 @@ impl Default for MediaCache {
         let budget = crate::memory::cache_share(crate::memory::budget());
         MediaCache {
             full_frame_loader: None,
+            canvas_sizes: HashMap::new(),
             settings_hashes: SettingsHashes::default(),
             thumbs: Lru::new(THUMB_SOURCE_BYTES.min(budget)),
             previews: Vec::new(),
@@ -687,9 +691,27 @@ impl MediaCache {
         self.source_ref_with(p, level, false)
     }
 
+    /// Whether photo `p`'s file decodes to its whole picture, past its default crop ("Show Full Image" on, and the
+    /// host has a loader for it).
+    pub fn shows_full_frame(&self, p: &Photo) -> bool {
+        p.develop.crop.full_frame && self.full_frame_loader.is_some()
+    }
+
+    /// What a decoded source of photo `p` must have been made from to be kept ([`crate::Session::accept`]): the file's
+    /// content and, with "Show Full Image" on, the whole-picture decode. A job planned before the file changed or the
+    /// option was toggled finishes with another key, and its source is dropped instead of undoing the change.
+    pub fn source_key(&self, p: &Photo) -> Hash128 {
+        let mut h = Hasher128::new();
+        h.str(&content_key(p));
+        if self.shows_full_frame(p) {
+            h.str("full-frame");
+        }
+        h.finish()
+    }
+
     fn source_ref_with(&mut self, p: &Photo, level: SourceLevel, cached: bool) -> SourceRef {
         let mut r = self.source_ref_plain(p, level, cached);
-        if p.develop.crop.full_frame
+        if self.shows_full_frame(p)
             && let (SourceRef::File { loader, .. }, Some(full)) = (&mut r, &self.full_frame_loader)
         {
             // the whole picture, past the default crop (no denoised twin: that is made for the default crop)
@@ -1300,8 +1322,8 @@ impl crate::Session {
         // share a result (a view slot showing photo A would otherwise look current for photo B)
         // …and so is the file's content: a file changed on disk (Reload) renders afresh
         let content_key = content_key(&p);
-        let source_key = Hasher128::new().str(&content_key).finish();
-        let content = source_key.0 as u64;
+        let content = Hasher128::new().str(&content_key).finish().0 as u64;
+        let source_key = self.media.source_key(&p);
         // Temporary "before" settings must not replace the photo's cached develop hash.
         let settings_hash = if before { settings.hash64() } else { self.media.settings_hashes.get(id, &settings) };
         let salt = self.media.denoise_salt(id, &settings);
@@ -1379,7 +1401,7 @@ impl crate::Session {
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
-            source_key: Some(Hasher128::new().str(&content_key(&p)).finish()),
+            source_key: Some(self.media.source_key(&p)),
             photo: id,
             level,
             source,
@@ -1434,7 +1456,7 @@ impl crate::Session {
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
-            source_key: Some(Hasher128::new().str(&content_key(&p)).finish()),
+            source_key: Some(self.media.source_key(&p)),
             photo: id,
             level,
             source,
@@ -1626,7 +1648,7 @@ impl crate::Session {
     /// has wrong is corrected too ([`Self::learn_as_shot_wb`]).
     pub fn accept(&mut self, r: &RenderResult) {
         if let Some(src) = &r.loaded
-            && r.source_key.is_none_or(|key| self.catalog.photo(r.photo).is_some_and(|p| Hasher128::new().str(&content_key(p)).finish() == key))
+            && r.source_key.is_none_or(|key| self.catalog.photo(r.photo).is_some_and(|p| self.media.source_key(p) == key))
         {
             if let Some(info) = &src.info {
                 self.learn_as_shot_wb(r.photo, info);
@@ -1652,6 +1674,38 @@ impl crate::Session {
         if let Err(e) = self.apply_system(Op::SetAsShotWb { id, wb: Some(read) }) {
             log::warn!("photo {}: as-shot white balance not recorded: {e}", id.0);
         }
+    }
+
+    /// The size (oriented) of the picture photo `id` is developed from, before its crop: the catalog's size, except
+    /// with "Show Full Image" on, where it is the raw's whole picture past its default crop (read from the file's
+    /// headers once per file content). Export plans its native size from this. A file that can't be read gives the
+    /// catalog's size (the render then says what is wrong). `None`: no such photo.
+    pub fn canvas_size(&mut self, id: PhotoId) -> Option<(u32, u32)> {
+        let p = self.catalog.photo(id)?;
+        let listed = (p.width, p.height);
+        let Source::File { path } = &p.source else { return Some(listed) };
+        if !self.media.shows_full_frame(p) {
+            return Some(listed);
+        }
+        let key = content_key(p);
+        if let Some((k, size)) = self.media.canvas_sizes.get(&id)
+            && *k == key
+        {
+            return Some(*size);
+        }
+        let bytes = match &self.media.file_bytes {
+            Some(read) => read(path),
+            None => std::fs::read(path).map_err(|e| format!("{path}: {e}")),
+        };
+        let size = match bytes.and_then(|b| crate::files::full_frame_size(&b)) {
+            Ok(size) => size,
+            Err(e) => {
+                log::warn!("photo {}: whole picture size not read: {e}", id.0);
+                return Some(listed);
+            }
+        };
+        self.media.canvas_sizes.insert(id, (key, size));
+        Some(size)
     }
 
     /// Synchronous render (CLI, MCP, tests).

@@ -415,6 +415,16 @@ fn denoised_camera_rgb(raw: &lightcraft_raw::RawImage, spec: &DenoiseSpec, facto
     }
 }
 
+/// The size (oriented, square pixels) of the picture [`load_vec_full`] decodes from raw file `bytes`: the whole active
+/// area, past the default crop.
+pub fn full_frame_size(bytes: &[u8]) -> Result<(u32, u32), String> {
+    let raw = lightcraft_raw::probe_info(bytes).map_err(|e| e.to_string())?;
+    let a = raw.active_area;
+    let w = u32::try_from(a.width.max(1)).map_err(|_| "picture too wide".to_string())?;
+    let h = u32::try_from(lightcraft_raw::stretched_height(a.height, raw.pixel_aspect).max(1)).map_err(|_| "picture too tall".to_string())?;
+    Ok(if raw.orientation.swaps_axes() { (h, w) } else { (w, h) })
+}
+
 /// [`load_vec`] of a raw's whole picture, past its default crop ("Show Full Image").
 pub fn load_vec_full(bytes: Vec<u8>, max_edge: usize) -> Result<(Rgb32f, SourceInfo), String> {
     rayon::scope(move |_| load_bytes_now(std::borrow::Cow::Owned(bytes), max_edge, None, false, true).map(|(img, _, info, _)| (img, info)))

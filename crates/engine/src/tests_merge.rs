@@ -271,3 +271,77 @@ fn a_photo_named_twice_is_merged_once() {
     assert_eq!(job.sources.iter().map(|(p, _)| p.0).collect::<Vec<_>>(), vec![a, b]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A 100×60 linear DNG with a 40×40 default crop at (20, 10), imported and selected (PR #2030 review).
+fn dng_with_default_crop(tag: &str) -> (std::path::PathBuf, Session, lightcraft_catalog::PhotoId) {
+    let dir = temp_dir(tag);
+    let image = lightcraft_raster::Rgb32f::from_fn(100, 60, |x, y| [0.1 + x as f32 / 200.0, 0.2 + y as f32 / 200.0, 0.3]);
+    let to_xyz_d50 = lightcraft_color::bradford(lightcraft_color::D65, lightcraft_color::D50).mul(&lightcraft_color::SRGB.to_xyz());
+    let color = lightcraft_merge::FrameColor::Linear { to_xyz_d50 };
+    let dng = lightcraft_merge::write_linear_dng(
+        &image,
+        &color,
+        lightcraft_geom::Orientation::Normal,
+        &Default::default(),
+        0.0,
+        lightcraft_merge::DngSamples::Half,
+        &[],
+    )
+    .unwrap();
+    let mut raw = lightcraft_raw::decode(&dng).unwrap();
+    raw.crop = lightcraft_raw::Rect::new(20, 10, 40, 40);
+    let path = dir.join("cropped.dng");
+    std::fs::write(&path, lightcraft_raw::write_dng(&raw, &Default::default()).unwrap()).unwrap();
+    let mut s = Session::new().with_fs();
+    let id = lightcraft_catalog::PhotoId(import(&mut s, vec![path.to_string_lossy().to_string()])[0]);
+    s.selection = crate::Selection::single(id);
+    let p = s.catalog.photo(id).unwrap();
+    assert_eq!((p.width, p.height), (40, 40), "the photo is its default crop");
+    (dir, s, id)
+}
+
+/// Show Full Image exports the whole picture at its own size, not scaled into the default crop's size.
+#[test]
+fn full_image_exports_at_the_whole_pictures_size() {
+    let (dir, mut s, id) = dng_with_default_crop("full-export");
+    s.execute("crop.fullFrame", &json!({"on": true})).unwrap();
+    let view = s.render_now(id, 100, 100).unwrap().image;
+    assert_eq!((view.width, view.height), (100, 60));
+    assert_eq!(s.canvas_size(id), Some((100, 60)));
+    let options = crate::export::ExportOptions { format: crate::export::ExportFormat::Png, resize: None, ..Default::default() };
+    let exported = crate::export::export_photo(&mut s, id, &options, 1).unwrap();
+    assert_eq!((exported.width, exported.height), (100, 60));
+    let decoded = lightcraft_codecs::decode(&exported.bytes, lightcraft_codecs::DecodeOptions::default()).unwrap();
+    assert_eq!((decoded.image.width, decoded.image.height), (100, 60));
+    // and back: the default crop's size
+    s.execute("crop.fullFrame", &json!({"on": false})).unwrap();
+    assert_eq!(s.canvas_size(id), Some((40, 40)));
+    let exported = crate::export::export_photo(&mut s, id, &options, 1).unwrap();
+    assert_eq!((exported.width, exported.height), (40, 40));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A decode planned before Show Full Image was toggled that finishes after it doesn't put the old picture back.
+#[test]
+fn a_decode_from_before_full_image_is_not_kept() {
+    let (dir, mut s, id) = dng_with_default_crop("full-late");
+    let old = s.render_job(id, 100, 100, false, true).unwrap();
+    s.execute("crop.fullFrame", &json!({"on": true})).unwrap();
+    let late = old.run();
+    assert!(late.rendered.is_ok() && late.loaded.is_some());
+    s.accept(&late);
+    let full = s.render_now(id, 100, 100).unwrap().image;
+    assert_eq!((full.width, full.height), (100, 60), "the whole picture, not the late default crop");
+    // the other way: a whole-picture decode that finishes after the toggle is undone
+    let old = s.render_job(id, 100, 100, false, true).unwrap();
+    s.media.forget(id);
+    let old = old.run();
+    s.undo_step().unwrap();
+    s.accept(&old);
+    let cropped = s.render_now(id, 100, 100).unwrap().image;
+    assert_eq!((cropped.width, cropped.height), (100, 100));
+    s.redo_step().unwrap();
+    let full = s.render_now(id, 100, 100).unwrap().image;
+    assert_eq!((full.width, full.height), (100, 60));
+    let _ = std::fs::remove_dir_all(&dir);
+}
