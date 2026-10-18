@@ -90,6 +90,8 @@ impl eframe::App for App {
         }
         self.0.logic(ctx);
         self.1.tick(&mut self.0, ctx);
+        // for a device lost in the middle of a frame, when this app can't save any more (`main`)
+        UNSAVED_CHANGES.store(unsaved_changes(&self.0.session), std::sync::atomic::Ordering::Relaxed);
     }
     /// Forwards the host's raw-input pass to the app's hook before egui processes it, keeping
     /// modal/prompt input barriers and queued synthetic or dropped input ahead of the panels.
@@ -210,6 +212,25 @@ enum LostDevice {
     SaveFailed(Unsaved),
     /// Saved: asking whether to restart or quit.
     Ask,
+}
+
+/// How many changes the running app couldn't write to disk, as of its latest frame: a device lost
+/// in the middle of a frame stops the app before it can save again, and it only starts again
+/// when there are none ([`relaunch_after_lost_frame`]).
+static UNSAVED_CHANGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many changes `session` couldn't write to disk (the journal failed); they stay queued.
+fn unsaved_changes(session: &Session) -> usize {
+    session.unsaved().map_or(0, |(changes, _)| changes)
+}
+
+/// `run_native` ended while the window was up: whether to start LightCraft again, with renders on
+/// a device of their own. Only when it stopped on an error after the device renders share with the
+/// window was lost while a frame was drawn (egui-wgpu panics there before `logic` can stop
+/// drawing), and only with every change saved: edits that couldn't be written are never left
+/// behind by a restart that says nothing; the stop dialog says so instead.
+fn relaunch_after_lost_frame(stopped_with_error: bool, window_device_lost: bool, unsaved_changes: usize) -> bool {
+    stopped_with_error && window_device_lost && unsaved_changes == 0
 }
 
 /// The running app's lost-device steps (it has one window).
@@ -1232,6 +1253,15 @@ fn main() -> eframe::Result {
             Ok(r) => r,
             Err(_) => Err(eframe::Error::AppCreation("its window stopped drawing (the renderer panicked)".into())),
         };
+        // the device renders share with the window was lost while a frame was being drawn: start
+        // again the same way as after the lost-device dialog (no marker: the GPU stays on)
+        let unsaved = UNSAVED_CHANGES.load(std::sync::atomic::Ordering::Relaxed);
+        if relaunch_after_lost_frame(stopped.is_err(), lightcraft_engine::gpu::window_device_lost(), unsaved)
+            && window_gpu::relaunch_with_own_render_device()
+        {
+            log::error!("LightCraft lost its graphics device while drawing; starting again");
+            return Ok(());
+        }
         if let Err(e) = &stopped {
             let lost = gpu_lost_reason();
             if let Some(reason) = &lost
@@ -1240,10 +1270,13 @@ fn main() -> eframe::Result {
                 record_gpu_lost(gpu_lost_marker_path().as_deref(), reason);
             }
             // (not "app creation error: …": the app had been created)
-            let what = match e {
+            let mut what = match e {
                 eframe::Error::AppCreation(m) => m.to_string(),
                 e => e.to_string(),
             };
+            if unsaved > 0 {
+                what = format!("{what}; {unsaved} change(s) couldn't be saved to disk before it stopped");
+            }
             stopped_while_running(&stopped_text(&what, lost.as_deref()), log_file.as_deref());
         }
         return stopped;
@@ -1251,12 +1284,6 @@ fn main() -> eframe::Result {
     // a panic that still escaped the renderer's start (the probe and error handler should
     // prevent it): an error like any other failed start
     let started = started.unwrap_or_else(|_| Err(eframe::Error::AppCreation("the window's renderer panicked while starting".into())));
-    // the device renders share with the window was lost while a frame was being drawn (egui-wgpu
-    // panics there): not a failed start — start again, with renders on a device of their own
-    if started.is_err() && lightcraft_engine::gpu::window_device_lost() && window_gpu::relaunch_with_own_render_device() {
-        log::error!("LightCraft lost its graphics device while drawing; starting again");
-        return Ok(());
-    }
     if let Err(e) = &started {
         // the renderer never came up: start again, which tries the next one in the chain
         if window_gpu::relaunch_after_failure(&win_files) {
@@ -1471,6 +1498,26 @@ mod tests {
         assert_eq!(app.after_device_lost(&mut stage, &mut answers), LostOutcome::Quit);
         assert!(answers.told.is_empty());
         assert_eq!(answers.restart_asked, 2);
+    }
+
+    /// PR #1240 review: a device lost in the middle of a frame (after the window came up) starts
+    /// LightCraft again instead of stopping with "LightCraft stopped" and the GPU off next time,
+    /// but never while edits couldn't be saved, and never for any other way the app ended.
+    #[test]
+    fn a_device_lost_mid_frame_starts_again_only_with_everything_saved() {
+        let disk = FailingDisk::default();
+        let mut session = disk.session();
+        session.execute("photo.rate", &serde_json::json!({"rating": 3})).unwrap();
+        assert_eq!(unsaved_changes(&session), 0);
+        assert!(relaunch_after_lost_frame(true, true, unsaved_changes(&session)), "lost mid-frame, all saved: start again");
+        // another error, or a window closed normally: no restart
+        assert!(!relaunch_after_lost_frame(true, false, 0));
+        assert!(!relaunch_after_lost_frame(false, true, 0));
+        // an edit the journal couldn't take: stop and say so, never a silent restart
+        disk.set_failing(true);
+        assert!(session.execute("photo.rate", &serde_json::json!({"rating": 4})).is_err());
+        assert_eq!(unsaved_changes(&session), 1);
+        assert!(!relaunch_after_lost_frame(true, true, unsaved_changes(&session)));
     }
 
     /// Issue #374: launch arguments that would walk a whole drive or home folder are reported,
