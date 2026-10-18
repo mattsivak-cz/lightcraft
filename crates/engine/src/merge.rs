@@ -77,7 +77,8 @@ pub struct MergeFinish {
 
 /// The decoded photos of recent merge previews, so a preview whose options change (another projection, a deghost
 /// amount) reads and decodes nothing again. Keyed by file (path, size, modification time), preview size and
-/// orientation; at most [`FRAME_CACHE_BYTES`], the least recently used out first. Full-size merges don't use it.
+/// orientation; at most [`FRAME_CACHE_BYTES`], the least recently used out first. Full-size merges don't use it:
+/// planning one releases it (so the stitch gets the memory it was sized for), as does clearing the session's sources.
 #[derive(Clone, Default)]
 pub struct FrameCache(Arc<std::sync::Mutex<Vec<(FrameKey, Frame)>>>);
 
@@ -126,6 +127,11 @@ impl FrameCache {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Drop every held photo.
+    pub fn clear(&self) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 }
 
@@ -540,6 +546,11 @@ impl Session {
             Some(r) => r.clone(),
             None => Arc::new(|path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"))),
         };
+        // A full-size merge doesn't use the preview photos, and the panorama's size is fitted to the memory left
+        // beside the session's budget (`fit_in_memory`), which doesn't count them: let them go.
+        if !preview {
+            self.media.merge_frames.clear();
+        }
         let frames = preview.then(|| self.media.merge_frames.clone());
         Ok(MergeJob { kind, finish, sources, preview: preview.then_some(PREVIEW_EDGE), read, frames })
     }
