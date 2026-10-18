@@ -261,8 +261,18 @@ impl MergeJob {
             }
             MergeKind::HdrPanorama { hdr, pano, bracket } => {
                 let n = self.sources.len();
+                // A preview that detects the bracket size decodes every photo first (each read once, or none when the
+                // preview cache holds it) and takes the exposures from them: reading each file for its EXIF and again
+                // to decode it doubled the reads, and an option change reread every file despite the cache.
+                let decoded = match (*bracket < 2, self.preview) {
+                    (true, Some(_)) => Some(self.load_sources(&self.sources, false, progress, (0.0, 0.3))?),
+                    _ => None,
+                };
                 let b = if *bracket >= 2 {
                     *bracket
+                } else if let Some(frames) = &decoded {
+                    let ev: Option<Vec<f64>> = frames.iter().map(|f| lightcraft_merge::frame::exif_exposure(&f.metadata)).collect();
+                    ev.as_deref().and_then(detect_bracket).ok_or("could not detect the bracket size from EXIF; set it")?
                 } else {
                     // the bracket size from the photos' EXIF exposures (read without decoding them)
                     let ev: Option<Vec<f64>> = self
@@ -279,10 +289,16 @@ impl MergeJob {
                 }
                 let groups = n / b;
                 let mut merged = Vec::new();
+                // the brackets' share of the progress, after the decoding above when it ran
+                let start = if decoded.is_some() { 0.3 } else { 0.0 };
+                let mut decoded = decoded.map(Vec::into_iter);
                 // one bracket at a time: only its photos are held at full size, never all of them
                 for (g, set) in self.sources.chunks(b).enumerate() {
-                    let at = |t: f32| 0.6 * (g as f32 + t) / groups as f32;
-                    let set = self.load_sources(set, false, progress, (at(0.0), at(0.5)))?;
+                    let at = |t: f32| start + (0.6 - start) * (g as f32 + t) / groups as f32;
+                    let set = match &mut decoded {
+                        Some(frames) => frames.by_ref().take(b).collect(),
+                        None => self.load_sources(set, false, progress, (at(0.0), at(0.5)))?,
+                    };
                     let p = sub(at(0.5), at(1.0));
                     let r = lightcraft_merge::merge_hdr(set, hdr, &p).map_err(err)?;
                     let mut f = Frame {

@@ -282,3 +282,53 @@ fn a_changed_preview_reuses_its_decoded_photos() {
     assert_eq!(s.media.merge_frames.len(), 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An HDR panorama preview that detects the bracket size reads each photo once, and an option change reads none
+/// (the exposures come from the decoded photos, not from reading every file again).
+#[test]
+fn hdr_panorama_previews_read_each_photo_once() {
+    use lightcraft_merge::{DngSamples, frame::FrameColor};
+    let dir = temp_dir("hdr-pano-cache");
+    let color = FrameColor::Linear {
+        to_xyz_d50: lightcraft_color::bradford(lightcraft_color::D65, lightcraft_color::D50).mul(&lightcraft_color::SRGB.to_xyz()),
+    };
+    let mut paths = Vec::new();
+    for (g, view) in lightcraft_merge::synth::pano_views(320, 240, 280.0, &[-15.0, 15.0]).unwrap().into_iter().enumerate() {
+        for (e, ev) in [-1.0_f64, 1.0].into_iter().enumerate() {
+            let mut image = view.clone();
+            for p in &mut image.data {
+                *p = p.map(|v| (v * 2f32.powf(ev as f32)).min(1.0));
+            }
+            let meta =
+                lightcraft_meta::Metadata { exposure_time: Some(2f64.powf(ev) / 125.0), f_number: Some(8.0), iso: Some(100), ..Default::default() };
+            let bytes =
+                lightcraft_merge::write_linear_dng(&image, &color, lightcraft_geom::Orientation::Normal, &meta, 0.0, DngSamples::U16, &[]).unwrap();
+            let path = dir.join(format!("P_{g}_{e}.dng"));
+            std::fs::write(&path, bytes).unwrap();
+            paths.push(path.to_string_lossy().to_string());
+        }
+    }
+    let mut s = Session::new().with_fs();
+    let ids = import(&mut s, paths);
+    assert_eq!(ids.len(), 4);
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let r = reads.clone();
+    s.media.file_bytes = Some(std::sync::Arc::new(move |path: &str| {
+        r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::fs::read(path).map_err(|e| e.to_string())
+    }));
+    let count = || reads.load(std::sync::atomic::Ordering::Relaxed);
+    let opts = json!({"ids": ids, "preview": true, "align": false, "autoSettings": false});
+    let a = s.execute("merge.hdrPanorama", &opts).unwrap();
+    assert_eq!(a["bracket"], 2);
+    assert_eq!(count(), 4, "the first preview reads each photo once");
+    let mut changed = opts.clone();
+    changed["deghost"] = json!("high");
+    let b = s.execute("merge.hdrPanorama", &changed).unwrap();
+    assert_eq!(b["bracket"], 2);
+    assert_eq!(count(), 4, "an option change read the photos again");
+    changed["bracket"] = json!(2);
+    s.execute("merge.hdrPanorama", &changed).unwrap();
+    assert_eq!(count(), 4, "an explicit bracket size read the photos again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
