@@ -133,6 +133,12 @@ impl FrameCache {
     pub fn clear(&self) {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
+
+    /// Change every held photo in place (tests).
+    #[cfg(test)]
+    pub(crate) fn edit(&self, mut change: impl FnMut(&mut Frame)) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().for_each(|(_, f)| change(f));
+    }
 }
 
 /// Reads a source photo's bytes (by catalog path).
@@ -277,7 +283,9 @@ impl MergeJob {
                 let b = if *bracket >= 2 {
                     *bracket
                 } else if let Some(frames) = &decoded {
-                    let ev: Option<Vec<f64>> = frames.iter().map(|f| lightcraft_merge::frame::exif_exposure(&f.metadata)).collect();
+                    // the exposure loading worked out from the whole file (EXIF, IPTC, XMP), not from the metadata the
+                    // raw decoder kept, which can lack it
+                    let ev: Option<Vec<f64>> = frames.iter().map(|f| f.exposure).collect();
                     ev.as_deref().and_then(detect_bracket).ok_or("could not detect the bracket size from EXIF; set it")?
                 } else {
                     // the bracket size from the photos' EXIF exposures (read without decoding them)

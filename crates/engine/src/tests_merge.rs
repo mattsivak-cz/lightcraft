@@ -264,12 +264,9 @@ fn a_changed_preview_reuses_its_decoded_photos() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An HDR panorama preview that detects the bracket size reads each photo once, and an option change reads none
-/// (the exposures come from the decoded photos, not from reading every file again).
-#[test]
-fn hdr_panorama_previews_read_each_photo_once() {
+/// Two panorama positions bracketed at -1 and +1 EV (EXIF exposures 1/250 and 1/62.5 s), as linear DNGs in `dir`.
+fn hdr_pano_dngs(dir: &std::path::Path) -> Vec<String> {
     use lightcraft_merge::{DngSamples, frame::FrameColor};
-    let dir = temp_dir("hdr-pano-cache");
     let color = FrameColor::Linear {
         to_xyz_d50: lightcraft_color::bradford(lightcraft_color::D65, lightcraft_color::D50).mul(&lightcraft_color::SRGB.to_xyz()),
     };
@@ -289,8 +286,16 @@ fn hdr_panorama_previews_read_each_photo_once() {
             paths.push(path.to_string_lossy().to_string());
         }
     }
+    paths
+}
+
+/// An HDR panorama preview that detects the bracket size reads each photo once, and an option change reads none
+/// (the exposures come from the decoded photos, not from reading every file again).
+#[test]
+fn hdr_panorama_previews_read_each_photo_once() {
+    let dir = temp_dir("hdr-pano-cache");
     let mut s = Session::new().with_fs();
-    let ids = import(&mut s, paths);
+    let ids = import(&mut s, hdr_pano_dngs(&dir));
     assert_eq!(ids.len(), 4);
     let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let r = reads.clone();
@@ -311,5 +316,26 @@ fn hdr_panorama_previews_read_each_photo_once() {
     changed["bracket"] = json!(2);
     s.execute("merge.hdrPanorama", &changed).unwrap();
     assert_eq!(count(), 4, "an explicit bracket size read the photos again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A preview detects the bracket size from each photo's exposure as loading worked it out from the whole file (EXIF,
+/// IPTC, XMP), not from the metadata its raw decoder kept, which can lack it.
+#[test]
+fn hdr_panorama_previews_detect_the_bracket_from_the_photos_exposures() {
+    let dir = temp_dir("hdr-pano-ev");
+    let mut s = Session::new().with_fs();
+    let ids = import(&mut s, hdr_pano_dngs(&dir));
+    let opts = json!({"ids": ids, "preview": true, "align": false, "autoSettings": false});
+    assert_eq!(s.execute("merge.hdrPanorama", &opts).unwrap()["bracket"], 2);
+    // the decoded photos as left by a raw decoder that kept no exposure time; their exposures stay
+    s.media.merge_frames.edit(|f| {
+        assert!(f.exposure.is_some());
+        f.metadata = lightcraft_meta::Metadata::default();
+    });
+    let mut changed = opts.clone();
+    changed["deghost"] = json!("high");
+    let r = s.execute("merge.hdrPanorama", &changed).unwrap();
+    assert_eq!(r["bracket"], 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
