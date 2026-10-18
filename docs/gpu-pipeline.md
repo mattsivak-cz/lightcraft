@@ -281,8 +281,11 @@ render that falls back to the CPU. A headless screenshot reads a texture back wh
 the window. A *lost* device (driver reset, GPU hang) is lost to the window too — as it was before
 sharing, when a reset took every device on the GPU. Renders go back to the CPU, and
 `lightcraft_gpu::window_device_lost()` is set: egui-wgpu panics drawing anything on a lost device,
-so the app draws empty frames and asks in a native dialog to restart or quit; after saving, a
-restart starts LightCraft again without `LIGHTCRAFT_GPU_TEXTURES`. A loss in the middle of a frame
+so the app draws empty frames, saves, and asks in a native dialog to restart or quit; a restart
+starts LightCraft again without `LIGHTCRAFT_GPU_TEXTURES`. If saving fails (the journal and the
+closing snapshot both), the edits stay in memory and a native dialog says how many and why and
+offers Try Again; the app ends without them only on Quit Anyway (tested by
+`tests::a_lost_device_never_quits_with_edits_that_could_not_be_saved` in `apps/lightcraft`). A loss in the middle of a frame
 (the panic happens before the app can stop drawing) ends `run_native` with an error, and the app
 starts again the same way; the library has written every command to its journal, so only a
 slider drag in progress is lost. Tested by `crates/gpu/tests/texture_lost.rs` and

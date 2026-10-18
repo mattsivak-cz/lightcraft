@@ -356,6 +356,21 @@ pub fn device_lost_message() -> (String, String, String, String) {
     )
 }
 
+/// The native dialog shown when the window's graphics device was lost and saving then failed:
+/// title, text (how many changes and why), and the two buttons (try again, quit anyway).
+pub fn device_lost_unsaved_message(changes: usize, reason: &str) -> (String, String, String, String) {
+    (
+        tr("LightCraft lost its graphics device").to_string(),
+        tr_format!(
+            "The graphics driver stopped responding, so LightCraft can't draw its window any more, and saving the library failed: {e}\n\nUnsaved changes: {n}. If you quit now, they are lost. Free some disk space or reconnect the library's drive, then try again.",
+            e = reason,
+            n = changes
+        ),
+        tr("Try Again").to_string(),
+        tr("Quit Anyway").to_string(),
+    )
+}
+
 /// A stock preset's or profile's name in the UI language; an imported or user-edited name stays
 /// exactly as its owner wrote it.
 pub fn builtin_label(source: &str, builtin: bool) -> &str {
@@ -973,6 +988,18 @@ mod tests {
             for key in [&english.0, &english.1, &english.2, &english.3] {
                 let value = language.tr(key);
                 assert!(!value.is_empty() && value != key.as_str(), "{language:?}: {key}");
+            }
+        }
+        // and the one shown when saving then failed, with how many changes and why
+        let english = device_lost_unsaved_message(3, "disk full");
+        assert!(english.1.contains("disk full") && english.1.contains('3'), "{}", english.1);
+        for language in Locale::ALL.iter().filter(|language| **language != Locale::En) {
+            set_language(*language);
+            let message = device_lost_unsaved_message(3, "disk full");
+            set_language(Locale::En);
+            assert!(message.1.contains("disk full") && message.1.contains('3'), "{language:?}: {}", message.1);
+            for (value, key) in [(&message.0, &english.0), (&message.1, &english.1), (&message.2, &english.2), (&message.3, &english.3)] {
+                assert!(!value.is_empty() && value != key, "{language:?}: {key}");
             }
         }
     }

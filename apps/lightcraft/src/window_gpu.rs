@@ -255,6 +255,60 @@ fn ask_device_lost(ask: impl FnOnce((String, String, String, String)) + Send + '
     std::thread::Builder::new().name("device-lost".into()).spawn(move || ask(message))
 }
 
+/// The answer to the dialog shown when saving failed after the device was lost: `None` when no
+/// dialog is up, `Some(None)` while it is open, then `Some(Some(quit_anyway))` until read.
+static UNSAVED_ANSWER: std::sync::Mutex<Option<Option<bool>>> = std::sync::Mutex::new(None);
+
+/// Saving failed after the window's device was lost: `changes` couldn't be written to disk, for
+/// `reason`. Asks in a native dialog on its own thread whether to try again or quit without them;
+/// `Some(true)` is Quit Anyway, `Some(false)` Try Again (each answer is read once, so a failed
+/// retry asks again). Without a dialog (`LIGHTCRAFT_NO_PREFS`, or no thread for one) nothing is
+/// answered: the changes are never dropped without someone choosing to.
+pub fn unsaved_answer(ctx: &egui::Context, changes: usize, reason: &str) -> Option<bool> {
+    let mut answer = UNSAVED_ANSWER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match *answer {
+        Some(Some(quit)) => {
+            *answer = None;
+            return Some(quit);
+        }
+        Some(None) => return None,
+        None => {}
+    }
+    if std::env::var_os("LIGHTCRAFT_NO_PREFS").is_some() {
+        return None;
+    }
+    log::error!("window: {changes} change(s) couldn't be saved after the graphics device was lost: {reason}");
+    let ctx = ctx.clone();
+    let asked = ask_unsaved(changes, reason, move |(title, text, try_again, quit)| {
+        let r = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title(title)
+            .set_description(text)
+            .set_buttons(rfd::MessageButtons::OkCancelCustom(try_again, quit.clone()))
+            .show();
+        // (as for the lost-device dialog: some platforms answer Ok / Cancel for the two buttons)
+        let quit = matches!(&r, rfd::MessageDialogResult::Custom(b) if *b == quit) || r == rfd::MessageDialogResult::Cancel;
+        *UNSAVED_ANSWER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Some(quit));
+        ctx.request_repaint();
+    });
+    match asked {
+        Ok(_) => *answer = Some(None),
+        Err(e) => log::error!("window: could not ask about the unsaved changes: {e}"),
+    }
+    None
+}
+
+/// Shows the saving-failed dialog (`ask`) on a thread of its own, its message put together on the
+/// calling (UI) thread, as [`ask_device_lost`] does.
+fn ask_unsaved(
+    changes: usize,
+    reason: &str,
+    ask: impl FnOnce((String, String, String, String)) + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let message = lightcraft_ui_egui::i18n::device_lost_unsaved_message(changes, reason);
+    std::thread::Builder::new().name("device-lost".into()).spawn(move || ask(message))
+}
+
 /// Start LightCraft again after the window's device was lost, with the arguments it was started
 /// with and renders on a device of their own (`LIGHTCRAFT_GPU_TEXTURES` cleared, so the
 /// default): a driver that loses shared devices can't take the new window down with a render.

@@ -69,15 +69,19 @@ impl eframe::App for App {
             // Quit from the menu bar: save exactly what closing the window saves (settings and
             // library, after the unsaved-changes check; otherwise its prompt shows), then end the
             // process instead of closing the viewport while AppKit is terminating (PR #444).
-            self.save_and_shut_down();
+            // (`may_close` has already offered to keep changes that couldn't be saved)
+            let _unsaved = self.save_and_shut_down();
             std::process::exit(0);
         }
         // The window's device was lost (issue #1228: renders share it): nothing can be drawn on it
         // again. Save, then restart or quit as the user answers (nothing else runs meanwhile).
         if lightcraft_engine::gpu::window_device_lost() {
-            if let Some(restart) = window_gpu::device_lost_answer(ctx) {
-                self.save_and_shut_down();
-                if restart {
+            let mut stage = LOST_STAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let next = self.after_device_lost(&mut stage, &mut WindowDialogs(ctx));
+            drop(stage);
+            if next != LostOutcome::Wait {
+                self.shut_down();
+                if next == LostOutcome::Restart {
                     window_gpu::relaunch_with_own_render_device();
                 }
                 std::process::exit(0);
@@ -102,7 +106,8 @@ impl eframe::App for App {
         self.0.ui(ui);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.save_and_shut_down();
+        // (closing the window went through `may_close`, which offers to keep unsaved changes)
+        let _unsaved = self.save_and_shut_down();
         // macOS (#1331): end the process here, before eframe tears the window down, as Quit from
         // the menu bar already does (PR #444). AccessKit's macOS adapter subclasses the window's
         // content view and restores its class on teardown; AppKit's Touch Bar support observes
@@ -117,10 +122,19 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// Save settings and the library, then wait for background work: closing the window, Quit
-    /// from the macOS menu bar, or starting again after a lost graphics device (which must not
-    /// end the process here, so the macOS exit stays in `on_exit`).
-    fn save_and_shut_down(&mut self) {
+    /// Save settings and the library, then wait for background work: closing the window or Quit
+    /// from the macOS menu bar (which must not end the process here, so the macOS exit stays in
+    /// `on_exit`). Returns what [`App::save`] returns.
+    fn save_and_shut_down(&mut self) -> Result<(), Unsaved> {
+        let saved = self.save();
+        self.shut_down();
+        saved
+    }
+
+    /// Save settings and the library. Fails when changes are left that couldn't be written to disk
+    /// (the log and the closing snapshot both failed); they stay queued, so saving can be tried
+    /// again.
+    fn save(&mut self) -> Result<(), Unsaved> {
         // (a size the window was just given is remembered too)
         self.0.ui.window = self.1.window_at_exit(self.0.ui.window);
         if let Err(e) = self.1.save(&self.0) {
@@ -129,10 +143,107 @@ impl App {
         if let Err(e) = self.0.session.close_library() {
             log::error!("saving the library failed: {e}");
         }
-        // last, with everything saved: no render may be inside the GPU driver when the process ends
+        // (a snapshot that failed after the log took every change loses nothing)
+        match self.0.session.unsaved() {
+            None => Ok(()),
+            Some((changes, reason)) => Err(Unsaved { changes, reason: reason.to_string() }),
+        }
+    }
+
+    /// Wait for background work. Last, with everything saved: no render may be inside the GPU
+    /// driver when the process ends.
+    fn shut_down(&mut self) {
         if !self.0.shutdown(EXIT_WAIT) {
             log::warn!("quit: background work was still running after {EXIT_WAIT:?}");
         }
+    }
+
+    /// One frame of the window after its graphics device was lost (issue #1228). It saves first,
+    /// so the restart-or-quit question can say everything is saved. When saving fails, the changes
+    /// stay in memory and a dialog says so and offers to try again: the process only ends without
+    /// them when the user picks Quit Anyway, as normal quit does (`notices::may_close`).
+    fn after_device_lost(&mut self, stage: &mut LostDevice, dialogs: &mut impl LostDeviceDialogs) -> LostOutcome {
+        // (Try Again saves again in the same frame; one retry per frame)
+        for _ in 0..2 {
+            if *stage == LostDevice::Save {
+                *stage = match self.save() {
+                    Ok(()) => LostDevice::Ask,
+                    Err(unsaved) => LostDevice::SaveFailed(unsaved),
+                };
+            }
+            match stage {
+                LostDevice::Save => {}
+                LostDevice::SaveFailed(unsaved) => match dialogs.quit_unsaved(unsaved) {
+                    None => return LostOutcome::Wait,
+                    Some(true) => {
+                        log::warn!("window: quitting without {} change(s) that couldn't be saved: {}", unsaved.changes, unsaved.reason);
+                        return LostOutcome::Quit;
+                    }
+                    Some(false) => *stage = LostDevice::Save,
+                },
+                LostDevice::Ask => {
+                    return match dialogs.restart() {
+                        None => LostOutcome::Wait,
+                        Some(true) => LostOutcome::Restart,
+                        Some(false) => LostOutcome::Quit,
+                    };
+                }
+            }
+        }
+        LostOutcome::Wait
+    }
+}
+
+/// Changes that couldn't be written to disk ([`App::save`]): how many, and why.
+#[derive(Debug, Clone, PartialEq)]
+struct Unsaved {
+    changes: usize,
+    reason: String,
+}
+
+/// Where the window is after its graphics device was lost ([`App::after_device_lost`]).
+#[derive(Debug, Clone, PartialEq)]
+enum LostDevice {
+    /// Save settings and the library.
+    Save,
+    /// Saving failed: asking whether to try again or quit without these changes.
+    SaveFailed(Unsaved),
+    /// Saved: asking whether to restart or quit.
+    Ask,
+}
+
+/// The running app's lost-device steps (it has one window).
+static LOST_STAGE: std::sync::Mutex<LostDevice> = std::sync::Mutex::new(LostDevice::Save);
+
+/// What [`App::after_device_lost`] decided this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LostOutcome {
+    /// Keep running: a dialog is open, or saving failed and the user hasn't chosen yet.
+    Wait,
+    /// End the process.
+    Quit,
+    /// Start LightCraft again, then end this process.
+    Restart,
+}
+
+/// The native dialogs of the lost-device steps (`window_gpu`); tests answer them instead.
+trait LostDeviceDialogs {
+    /// Restart (`true`) or quit; `None` while the dialog is open.
+    fn restart(&mut self) -> Option<bool>;
+    /// Saving failed: quit anyway, losing the changes (`true`), or try again (`false`); `None`
+    /// while the dialog is open.
+    fn quit_unsaved(&mut self, unsaved: &Unsaved) -> Option<bool>;
+}
+
+/// The real dialogs, each on a thread of its own (the window can't draw).
+struct WindowDialogs<'a>(&'a egui::Context);
+
+impl LostDeviceDialogs for WindowDialogs<'_> {
+    fn restart(&mut self) -> Option<bool> {
+        window_gpu::device_lost_answer(self.0)
+    }
+    fn quit_unsaved(&mut self, unsaved: &Unsaved) -> Option<bool> {
+        window_gpu::unsaved_answer(self.0, unsaved.changes, &unsaved.reason)
     }
 }
 
@@ -1212,6 +1323,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A library store whose writes fail while `fail` is set (a full or unplugged disk).
+    #[derive(Clone, Default)]
+    struct FailingDisk {
+        files: lightcraft_engine::catalog::MemStore,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FailingDisk {
+        fn set_failing(&self, on: bool) {
+            self.fail.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn check(&self) -> std::io::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) { Err(std::io::Error::other("disk full")) } else { Ok(()) }
+        }
+        fn session(&self) -> Session {
+            let mut session = Session::new();
+            let stores = lightcraft_engine::library::LibraryStores {
+                dir: "failing".into(),
+                catalog: Box::new(self.clone()),
+                files: Box::new(lightcraft_engine::catalog::MemStore::new()),
+                on_disk: false,
+            };
+            session.open_library_in(stores, true).unwrap();
+            session
+        }
+    }
+
+    impl lightcraft_engine::catalog::Store for FailingDisk {
+        fn read(&mut self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+            self.files.read(name)
+        }
+        fn write_atomic(&mut self, name: &str, data: &[u8]) -> std::io::Result<()> {
+            self.check()?;
+            self.files.write_atomic(name, data)
+        }
+        fn append(&mut self, name: &str, data: &[u8]) -> std::io::Result<()> {
+            self.check()?;
+            self.files.append(name, data)
+        }
+        fn truncate(&mut self, name: &str, len: u64) -> std::io::Result<()> {
+            self.files.truncate(name, len)
+        }
+        fn describe(&self) -> String {
+            "failing".into()
+        }
+    }
+
+    /// Answers the lost-device dialogs as a user would, and records what was asked.
+    #[derive(Default)]
+    struct Answers {
+        /// Answers to "saving failed: try again or quit anyway?", in turn (`None`: still open).
+        quit_unsaved: std::collections::VecDeque<Option<bool>>,
+        /// What that dialog was told each time it was shown.
+        told: Vec<Unsaved>,
+        /// The answer to "restart or quit?".
+        restart: Option<bool>,
+        restart_asked: usize,
+    }
+
+    impl LostDeviceDialogs for Answers {
+        fn restart(&mut self) -> Option<bool> {
+            self.restart_asked += 1;
+            self.restart
+        }
+        fn quit_unsaved(&mut self, unsaved: &Unsaved) -> Option<bool> {
+            self.told.push(unsaved.clone());
+            self.quit_unsaved.pop_front().flatten()
+        }
+    }
+
+    fn app_on(session: Session) -> App {
+        App(
+            LightcraftApp::new(session, Services::default()),
+            PrefsWriter::default(),
+            #[cfg(target_os = "macos")]
+            None,
+        )
+    }
+
+    /// PR #1240 review: after the window's device is lost, a save that fails (log and closing
+    /// snapshot both) neither ends nor restarts the app: the edits stay queued in memory, the user
+    /// is told how many and why, and Try Again saves them once the disk is back. Only then is the
+    /// restart question (which says the edits are saved) asked.
+    #[test]
+    fn a_lost_device_never_quits_with_edits_that_could_not_be_saved() {
+        let disk = FailingDisk::default();
+        let mut app = app_on(disk.session());
+        let id = app.0.session.selection.active.unwrap();
+        disk.set_failing(true);
+        assert!(app.0.session.execute("photo.rate", &serde_json::json!({"rating": 4})).is_err());
+        assert_eq!(app.0.session.unsaved().map(|u| u.0), Some(1));
+
+        let mut stage = LostDevice::Save;
+        let mut answers = Answers { restart: Some(true), ..Default::default() };
+        // the dialog is up: keep waiting, with the edit still queued
+        answers.quit_unsaved.push_back(None);
+        assert_eq!(app.after_device_lost(&mut stage, &mut answers), LostOutcome::Wait);
+        assert_eq!(answers.told.len(), 1);
+        assert_eq!(answers.told[0].changes, 1);
+        assert!(answers.told[0].reason.contains("disk full"), "{:?}", answers.told[0]);
+        // Try Again while the disk is still full: asked again, nothing lost, no restart
+        answers.quit_unsaved.push_back(Some(false));
+        assert_eq!(app.after_device_lost(&mut stage, &mut answers), LostOutcome::Wait);
+        assert_eq!(answers.told.len(), 3, "the failed retry asks again");
+        assert_eq!(answers.restart_asked, 0, "the restart question claims the edits are saved");
+        assert_eq!(app.0.session.unsaved().map(|u| u.0), Some(1));
+        assert!(matches!(stage, LostDevice::SaveFailed(_)), "{stage:?}");
+
+        // the disk is back: Try Again saves, then the restart question is asked
+        disk.set_failing(false);
+        answers.quit_unsaved.push_back(Some(false));
+        assert_eq!(app.after_device_lost(&mut stage, &mut answers), LostOutcome::Restart);
+        assert_eq!(answers.restart_asked, 1);
+        assert_eq!(app.0.session.unsaved(), None);
+        let reopened = disk.session();
+        assert_eq!(reopened.catalog.photo(id).map(|p| p.rating), Some(4), "the edit reached the disk");
+    }
+
+    /// Quit Anyway in that dialog is the one way to end without the unsaved edits, and it never
+    /// restarts.
+    #[test]
+    fn a_lost_device_quits_without_unsaved_edits_only_when_told_to() {
+        let disk = FailingDisk::default();
+        let mut app = app_on(disk.session());
+        disk.set_failing(true);
+        assert!(app.0.session.execute("photo.rate", &serde_json::json!({"rating": 2})).is_err());
+        let mut stage = LostDevice::Save;
+        let mut answers = Answers { restart: Some(true), ..Default::default() };
+        answers.quit_unsaved.push_back(Some(true));
+        assert_eq!(app.after_device_lost(&mut stage, &mut answers), LostOutcome::Quit);
+        assert_eq!(answers.restart_asked, 0);
+    }
+
+    /// When saving works, the restart question comes straight away.
+    #[test]
+    fn a_lost_device_saves_then_asks_to_restart() {
+        let disk = FailingDisk::default();
+        let mut app = app_on(disk.session());
+        app.0.session.execute("photo.rate", &serde_json::json!({"rating": 3})).unwrap();
+        let mut stage = LostDevice::Save;
+        let mut answers = Answers::default();
+        assert_eq!(app.after_device_lost(&mut stage, &mut answers), LostOutcome::Wait, "restart dialog still open");
+        answers.restart = Some(false);
+        assert_eq!(app.after_device_lost(&mut stage, &mut answers), LostOutcome::Quit);
+        assert!(answers.told.is_empty());
+        assert_eq!(answers.restart_asked, 2);
     }
 
     /// Issue #374: launch arguments that would walk a whole drive or home folder are reported,
