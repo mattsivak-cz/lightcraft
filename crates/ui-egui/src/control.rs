@@ -142,6 +142,9 @@ pub fn inspect(app: &LightcraftApp, ctx: &egui::Context) -> Value {
         "activity": app.session.activity.list(),
         // the list of them under the top bar's bell is open (`view.tasks`)
         "activityOpen": app.activity_open,
+        // the recent notifications that list keeps under the tasks, newest first, and how many came since it was open
+        "notifications": app.notifications.items.iter().map(|n| json!({"id": n.id, "text": n.text, "warning": n.warning, "details": n.report.is_some()})).collect::<Vec<_>>(),
+        "unread": app.notifications.unread,
         // commands waiting on a native file dialog shown off the UI thread (`pick`)
         "fileDialogs": app.pending_picks.iter().map(|p| p.command.clone()).collect::<Vec<_>>(),
         "memory": memory(app),

@@ -13,6 +13,18 @@ elsewhere or a dialog closes it. Nothing floats over the panels: the list covers
 Quitting asks first while a task that can stop is running. Agents see the same list through `activity.list` /
 `activity.cancel`, and `ui.inspect` reports it as `activity` (and whether the list is open as `activityOpen`).
 
+## Notifications
+
+How a job ended is a toast at the bottom of the canvas, a few lines at most (it wraps to four, the rest is cut), and
+the pointer resting on it keeps it from fading. `LightcraftApp::notify` also keeps it in the list under the bell, below
+the tasks (`crate::notifications`, the newest 30; errors from `toast_error` go there too), and puts a dot on the bell,
+in the caution colour if one is a warning, until the list is opened. A result too long for a toast (every photo an
+import warned about) goes in a `Report`: the toast and the list entry then have a **Show Details** link that opens it
+as a dialog (`Dialog::Report`: a summary, groups with each folder once and its files' names after it, Copy to
+Clipboard). Never put a list in the toast itself. `ui.inspect` → `notifications` lists them, newest first
+(`{id, text, warning, details}`, `details`: has a report) and `unread` counts the new ones; ids `indicator:unread`,
+`toast`, `toast:details`, `notification:<id>`, `notification:details:<id>`, `activity:clear`, `notifications:empty`.
+
 The registry is `lightcraft_engine::activity` (`crates/engine/src/activity.rs`, `Session::activity`). The stack is
 `crates/ui-egui/src/panels/activity.rs`. Every job that can last more than a moment uses it; **don't add a progress
 window, panel or progress toast of your own**. A dialog may still show progress inline (the Synchronize Folder
