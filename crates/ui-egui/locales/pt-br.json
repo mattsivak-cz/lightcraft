@@ -2200,5 +2200,11 @@
   "Upright Level will be recalculated": "Vertical (Nível) será recalculado",
   "Upright Vertical will be recalculated": "Vertical (Vertical) será recalculado",
   "Upright Full will be recalculated": "Vertical (Completa) será recalculado",
-  "Saved Upright geometry is not supported": "A geometria salva de Vertical não é compatível"
+  "Saved Upright geometry is not supported": "A geometria salva de Vertical não é compatível",
+  "Include selected photos": "Incluir fotos selecionadas",
+  "Color Overlay": "Sobreposição de cor",
+  "Color Overlay on B&W": "Sobreposição de cor em P&B",
+  "Image on Black": "Imagem sobre preto",
+  "Image on White": "Imagem sobre branco",
+  "White on Black": "Branco sobre preto"
 }
