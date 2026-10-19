@@ -431,7 +431,7 @@ pub fn stage_bytes(stages: &StageCache) -> usize {
     }
 }
 
-/// Process V3 haze maps a view's GPU stages (kept with its [`StageCache`]) uploaded so far: one
+/// Process V4 haze maps a view's GPU stages (kept with its [`StageCache`]) uploaded so far: one
 /// per map, not one per render (a diagnostic); 0 when it has none.
 pub fn haze_uploads(stages: &StageCache) -> u64 {
     #[cfg(not(target_arch = "wasm32"))]

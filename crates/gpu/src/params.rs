@@ -27,14 +27,15 @@ const FIELDS: &[(&str, usize)] = &[
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
+    ("DEHAZE_V3", 1),
     ("SHARPEN", 1),
     ("SHARPEN_MASK", 1),
     ("HAS_CLAR", 1),
     ("HAS_TEX", 1),
     ("HAS_DARK", 1),
     ("HAS_CHROMA", 1),
-    // process V3's haze map (`lightcraft_pipeline::haze`): its a / b proxy (interleaved) is bound
-    // in place of the V1 / V2 dark plane, which V3 doesn't compute
+    // process V4's haze map (`lightcraft_pipeline::haze`): its a / b proxy (interleaved) is bound
+    // in place of the V1 / V2 dark plane, which V4 doesn't compute
     ("HAS_HAZE", 1),
     ("HAZE_W", 1),
     ("HAZE_H", 1),
@@ -66,7 +67,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("VIG_HL", 1),
     ("VIG_STYLE", 1),
     // the window's offset in the whole output and the whole output's size (pixels; the vignette
-    // and V3's haze map read it)
+    // and V4's haze map read it)
     ("VIG_VIEW", 4),
     ("GRAIN", 1),
     ("GRAIN_AMT", 1),
@@ -148,7 +149,7 @@ pub struct Present {
 }
 
 /// The `finish` kernel's parameter block and auxiliary table (tone LUT | chroma curve | sRGB LUT | curve LUTs |
-/// mask terms) for `fp` with `masks` (their local adjustments' terms) and, for process V3's Dehaze,
+/// mask terms) for `fp` with `masks` (their local adjustments' terms) and, for process V4's Dehaze,
 /// `haze`, the map whose coefficients ([`haze_coeffs`]) are bound in the `dark` slot.
 pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Present, haze: Option<&HazeMap>) -> (Vec<u32>, Vec<f32>) {
     let mut aux: Vec<f32> = fp.tone.lut().to_vec();
@@ -185,6 +186,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     p.f("CLAR", fp.clar);
     p.f("TEX", fp.tex);
     p.f("DEHAZE", fp.dehaze);
+    p.b("DEHAZE_V3", fp.dehaze_v3);
     p.f("SHARPEN", fp.sharpen);
     p.f("SHARPEN_MASK", fp.sharpen_mask);
     p.b("HAS_CLAR", present.clarity);

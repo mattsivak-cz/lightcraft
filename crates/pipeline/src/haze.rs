@@ -1,4 +1,4 @@
-//! The haze map of process V3's Dehaze (issue #1237): a dark-channel-prior estimate of how much of
+//! The haze map of process V4's Dehaze (issue #1237): a dark-channel-prior estimate of how much of
 //! each pixel is haze, computed once per image on a fixed-size proxy of the whole frame.
 //!
 //! Every render of the photo (any preview size, a zoomed window, the export, the GPU) samples the
@@ -19,7 +19,7 @@
 //! 5. an exposure-compensation LUT ([`COMP_N`] amounts): how much the recovery darkens the median
 //!    at each amount, so Dehaze clears haze without making the photo darker.
 //!
-//! [`dehaze_at`] is the per-pixel V3 Dehaze the CPU renderer applies with it (the GPU's `finish`
+//! [`dehaze_at`] is the per-pixel V4 Dehaze the CPU renderer applies with it (the GPU's `finish`
 //! kernel mirrors it).
 
 use std::sync::{Arc, Mutex};
@@ -434,7 +434,7 @@ impl Amount {
     }
 }
 
-/// The V3 Dehaze of one pixel: `c` is its white-balanced, exposed colour, `(a, b)` the map's
+/// The V4 Dehaze of one pixel: `c` is its white-balanced, exposed colour, `(a, b)` the map's
 /// coefficients where it sits in the whole output frame ([`HazeMap::coeffs`], [`HazeRow::coeffs`]:
 /// a window dehazes exactly like the whole render), `ctx` the render's values and `am` the amount.
 /// Returns the dehazed colour; a non-finite result falls back to `c`.
@@ -517,19 +517,19 @@ fn recover_with(ctx: &Ctx, am: &Amount, c: [f32; 3], d: f32, sky: impl FnOnce() 
     }
 }
 
-/// Whether `s` renders under process V3, whose Dehaze uses a [`HazeMap`].
-pub fn is_v3(s: &DevelopSettings) -> bool {
+/// Whether `s` renders under process V4, whose Dehaze uses a [`HazeMap`].
+pub fn is_v4(s: &DevelopSettings) -> bool {
     match s.process.process() {
-        Process::V1 | Process::V2 => false,
-        Process::V3 => true,
+        Process::V1 | Process::V2 | Process::V3 => false,
+        Process::V4 => true,
     }
 }
 
-/// Whether `s` dehazes with a [`HazeMap`]: process V3 with Dehaze (the Effects slider, its section
+/// Whether `s` dehazes with a [`HazeMap`]: process V4 with Dehaze (the Effects slider, its section
 /// on, or a mask's that the render evaluates: visible, with components) not zero.
 pub fn wanted(s: &DevelopSettings) -> bool {
     let masks = s.masks.iter().any(|m| m.visible && !m.components.is_empty() && m.adjust.dehaze != 0.0);
-    is_v3(s) && ((s.section_enabled("effects") && s.effects.dehaze != 0.0) || masks)
+    is_v4(s) && ((s.section_enabled("effects") && s.effects.dehaze != 0.0) || masks)
 }
 
 /// Proxy size (px) of the map of `frame` (the whole output frame).
@@ -600,7 +600,7 @@ pub fn cache_bytes() -> usize {
     cache().bytes()
 }
 
-/// Drop every map [`for_frame`] keeps (the next render of a dehazed V3 photo builds its map again).
+/// Drop every map [`for_frame`] keeps (the next render of a dehazed V4 photo builds its map again).
 pub fn clear_cache() {
     cache().0.clear();
 }
@@ -647,7 +647,7 @@ mod tests {
         e.map(decode)
     }
 
-    /// The V3 Dehaze of one pixel of linear (pre-exposure) colour `lin` with haze `d` at amount
+    /// The V4 Dehaze of one pixel of linear (pre-exposure) colour `lin` with haze `d` at amount
     /// `k`, exposed by `gain`: [`dehaze_at`] with the haze given.
     fn recover(map: &HazeMap, lin: [f32; 3], gain: f32, d: f32, k: f32) -> [f32; 3] {
         let ctx = Ctx::new(map, gain).expect("a positive gain");
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn the_cache_evicts_the_least_recently_used_and_stays_bounded() {
-        let shape = (Process::V3, 10, 10);
+        let shape = (Process::V4, 10, 10);
         let entry = |key: u64, src: u64| Cached { key, src, shape, map: Arc::new(HazeMap::empty()) };
         let mut c = MapCache::new();
         for k in 0..CACHE_KEEP as u64 {
@@ -867,7 +867,7 @@ mod tests {
         // a draft that misses reuses the latest of the same source and shape; a final render doesn't
         assert!(c.get(77, None).is_none());
         assert!(c.get(77, Some((100, shape))).is_some_and(|m| Arc::ptr_eq(&m, &first)));
-        assert!(c.get(77, Some((100, (Process::V3, 11, 10)))).is_none(), "another proxy size");
+        assert!(c.get(77, Some((100, (Process::V4, 11, 10)))).is_none(), "another proxy size");
         assert!(c.get(77, Some((5, shape))).is_none(), "another source");
     }
 
@@ -877,8 +877,8 @@ mod tests {
         assert!(map.bytes() >= 2 * 120 * 90 * 4, "{}", map.bytes());
         let mut c = MapCache::new();
         assert_eq!(c.bytes(), 0);
-        c.put(Cached { key: 1, src: 1, shape: (Process::V3, 120, 90), map: map.clone() });
-        c.put(Cached { key: 2, src: 2, shape: (Process::V3, 1, 1), map: Arc::new(HazeMap::empty()) });
+        c.put(Cached { key: 1, src: 1, shape: (Process::V4, 120, 90), map: map.clone() });
+        c.put(Cached { key: 2, src: 2, shape: (Process::V4, 1, 1), map: Arc::new(HazeMap::empty()) });
         assert_eq!(c.bytes(), map.bytes() + HazeMap::empty().bytes());
         // (the shared cache: other tests use it, so only that it answers)
         let _ = cache_bytes();
@@ -894,7 +894,7 @@ mod tests {
             shape: MaskShape::Linear { start: lightcraft_geom::Point::new(0.5, 0.0), end: lightcraft_geom::Point::new(0.5, 1.0) },
         };
         let mask = Mask { components: vec![comp], adjust: LocalAdjustments { dehaze: 40.0, ..Default::default() }, ..Default::default() };
-        let mut s = DevelopSettings { process: Process::V3.version(), masks: vec![mask.clone()], ..DevelopSettings::default() };
+        let mut s = DevelopSettings { process: Process::V4.version(), masks: vec![mask.clone()], ..DevelopSettings::default() };
         assert!(wanted(&s));
         s.masks = vec![Mask { visible: false, ..mask.clone() }];
         assert!(!wanted(&s), "a hidden mask");
@@ -903,9 +903,9 @@ mod tests {
     }
 
     #[test]
-    fn wanted_only_for_v3_with_dehaze() {
+    fn wanted_only_for_v4_with_dehaze() {
         use lightcraft_develop::ProcessVersion;
-        let mut s = DevelopSettings { process: Process::V3.version(), ..DevelopSettings::default() };
+        let mut s = DevelopSettings { process: Process::V4.version(), ..DevelopSettings::default() };
         assert!(!wanted(&s));
         s.effects.dehaze = 30.0;
         assert!(wanted(&s));

@@ -204,7 +204,7 @@ pub(crate) struct Prepared {
     pub clarity_blur: Option<Arc<Plane>>,
     pub texture_blur: Option<Arc<Plane>>,
     pub dark: Option<Arc<Plane>>,
-    /// Process V3's haze map of the whole frame ([`Plan::haze`]); V3 dehazes with it instead of
+    /// Process V4's haze map of the whole frame ([`Plan::haze`]); V4 dehazes with it instead of
     /// `dark` / `air`.
     pub haze: Option<Arc<haze::HazeMap>>,
     /// Blurred chromaticity (`rgb / Y`) for local Moiré / Noise.
@@ -368,7 +368,7 @@ pub struct Plan<'a> {
     pub geo: u64,
     /// Key of the white-balanced, retouched, denoised image (and of the planes computed from it).
     /// It doesn't depend on the rendering process: a plane that does is keyed by it on its own
-    /// ([`local::BaseKey`]), and V3's haze map has its own cache ([`haze::for_frame`]).
+    /// ([`local::BaseKey`]), and V4's haze map has its own cache ([`haze::for_frame`]).
     pub lin_key: u64,
     /// [`Self::lin_key`] without the noise-reduction settings: draft renders reuse the smooth
     /// planes of an image that differs from this one only in its noise reduction.
@@ -377,9 +377,9 @@ pub struct Plan<'a> {
     pub eyes: Vec<redeye::EyeK>,
     /// The whole frame's dehaze airlight, for a windowed render (which can't see the whole frame).
     pub fixed_air: Option<f32>,
-    /// Process V3's dehaze haze map of the whole frame ([`haze::HazeMap`], cached per image): every
+    /// Process V4's dehaze haze map of the whole frame ([`haze::HazeMap`], cached per image): every
     /// render of the photo (any size, any window, CPU or GPU) samples the same one. `None` unless
-    /// the settings dehaze under V3 ([`haze::wanted`]).
+    /// the settings dehaze under V4 ([`haze::wanted`]).
     pub haze: Option<Arc<haze::HazeMap>>,
     /// A windowed render works on a larger window when spots reach into it (see
     /// [`spots::window_for_reads`]); this is the requested window inside the rendered one, which
@@ -426,8 +426,8 @@ fn plan_with<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &
     let (frame, w, h) = match req.window {
         Some(win) => {
             let win = win.clamped(full_w, full_h);
-            // (V3 dehazes with the haze map, which is already the whole frame's)
-            if !haze::is_v3(s) && s.section_enabled("effects") && (s.effects.dehaze != 0.0 || s.masks.iter().any(|m| m.adjust.dehaze != 0.0)) {
+            // (V4 dehazes with the haze map, which is already the whole frame's)
+            if !haze::is_v4(s) && s.section_enabled("effects") && (s.effects.dehaze != 0.0 || s.masks.iter().any(|m| m.adjust.dehaze != 0.0)) {
                 let k = (AIRLIGHT_PROXY_EDGE as f64 / full_w.max(full_h) as f64).min(1.0);
                 let (pw, ph) = (((full_w as f64 * k).round() as usize).max(1), ((full_h as f64 * k).round() as usize).max(1));
                 fixed_air = Some(local::frame_airlight(src, info, s, &frame, pw, ph));
@@ -489,6 +489,10 @@ pub fn settings_for<'a>(s: &'a DevelopSettings, req: &RenderRequest) -> std::bor
 
 /// Long edge (pixels) of the small HDR render [`hdr_histogram`] measures.
 pub const HDR_HISTOGRAM_EDGE: usize = 384;
+
+/// Long edge of the render that gives a slider drag its live HDR histogram (drafts have none: a
+/// second render per tick would slow them down), run beside the drafts by the UI.
+pub const HDR_HISTOGRAM_DRAG_EDGE: usize = 192;
 
 /// The histogram of an HDR edit's HDR rendition for a preview request `req`: a small float HDR
 /// render of the same framing ([`HDR_HISTOGRAM_EDGE`]), binned with SDR on the left half and the
@@ -616,7 +620,8 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     lap("histogram", &mut t);
     let mut image = image;
     let mask = overlay_alpha(req.overlay, &plan, &prep);
-    visualize::apply(&mut image, req.overlay, &plan, mask.as_ref());
+    let masks = overlay_alphas_all(req.overlay, &plan, &prep);
+    visualize::apply(&mut image, req.overlay, &plan, mask.as_ref(), masks.as_deref());
     let mut image = if plan.keep.is_some() { cut(&image) } else { image };
     if req.overlay == Overlay::HdrRange && edit.hdr.enabled {
         // the HDR rendition of the same request says how far above SDR white each pixel goes
@@ -669,6 +674,24 @@ fn overlay_alpha(o: Overlay, plan: &Plan<'_>, prep: &Prepared) -> Option<Plane> 
     Some(masks::evaluate_one(m, &plan.frame, plan.w, plan.h, &prep.img, &prep.log_l, ev, plan.mattes.as_deref()))
 }
 
+/// The alpha planes an `Overlay::AllMasks` shows: one per visible mask that has components,
+/// reusing the render's own evaluation where available (a fresh evaluation otherwise).
+fn overlay_alphas_all(o: Overlay, plan: &Plan<'_>, prep: &Prepared) -> Option<Vec<Plane>> {
+    if !matches!(o, Overlay::AllMasks { .. }) {
+        return None;
+    }
+    let ev = plan.settings.light.exposure as f32;
+    let mut out = Vec::new();
+    for m in plan.settings.masks.iter().filter(|m| m.visible && !m.components.is_empty()) {
+        if let Some(e) = prep.masks.iter().find(|e| e.id == m.id) {
+            out.push(e.alpha.clone());
+        } else {
+            out.push(masks::evaluate_one(m, &plan.frame, plan.w, plan.h, &prep.img, &prep.log_l, ev, plan.mattes.as_deref()));
+        }
+    }
+    Some(out)
+}
+
 /// Convenience: render a before/after pair side by side is up to the UI; this renders "before"
 /// (default look, keeping the crop so framing matches, under the photo's own rendering process).
 pub fn before_settings(s: &DevelopSettings) -> DevelopSettings {
@@ -706,6 +729,8 @@ pub(crate) fn for_rows<T: Send>(data: &mut [T], w: usize, f: impl Fn(usize, &mut
 mod tests;
 #[cfg(test)]
 mod tests_dehaze;
+#[cfg(test)]
+mod tests_dehaze_v4;
 #[cfg(test)]
 mod tests_geometry;
 #[cfg(test)]

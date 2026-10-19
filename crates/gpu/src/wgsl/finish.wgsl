@@ -1,6 +1,6 @@
 // The per-pixel stage: a straight port of `lightcraft_pipeline::finish` (keep in step with it).
 // Bindings: img (rgb, pre-exposure), log_l, base, clar, tex, dark (V1 / V2: the dehaze dark plane;
-// V3: the haze map's interleaved a / b coefficients), masks (NMASK planes, then the
+// V4: the haze map's interleaved a / b coefficients), masks (NMASK planes, then the
 // blurred chromaticity when HAS_CHROMA), aux
 // (tone LUT | chroma curve | sRGB LUT | curve LUTs | mask terms), out (packed RGBA8).
 
@@ -253,7 +253,7 @@ fn out_encode(v: f32) -> f32 {
     return 1.099 * pow(l, 0.45) - 0.099;
 }
 
-// --- process V3's Dehaze: `lightcraft_pipeline::haze::dehaze_at` with the whole frame's haze map
+// --- process V4's Dehaze: `lightcraft_pipeline::haze::dehaze_at` with the whole frame's haze map
 // (its a / b coefficients interleaved in `dark`, airlight and compensation LUT in `P`).
 
 fn hz_finite(v: f32) -> bool {
@@ -490,7 +490,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- dehaze (scene linear)
     let dz = pf(F_DEHAZE) + lt[10];
     if (dz != 0.0 && pu(F_HAS_HAZE) != 0u) {
-        // V3: the whole frame's haze map, sampled where this pixel sits in the whole output frame
+        // V4: the whole frame's haze map, sampled where this pixel sits in the whole output frame
         // (a window dehazes like the whole render)
         let nx = (pf(F_VIG_VIEW) + f32(x) + 0.5) / pf(F_VIG_VIEW + 2u);
         let ny = (pf(F_VIG_VIEW + 1u) + f32(y) + 0.5) / pf(F_VIG_VIEW + 3u);
@@ -500,7 +500,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (dz != 0.0 && pu(F_HAS_DARK) != 0u) {
         let d = clamp(dark[i] / pf(F_AIR_PRE), 0.0, 1.0);
         let air = pf(F_AIR);
-        if (dz > 0.0) {
+        if (dz > 0.0 && pu(F_DEHAZE_V3) != 0u) {
+            // process V3 (`finish::dehaze_v3_pixel`)
+            let k0 = clamp(dz, 0.0, 1.0);
+            let k = k0 * (0.4 + 0.6 * k0);
+            let t = max(1.0 - 0.95 * k * d, 0.3);
+            let veil = min(air * (1.0 - t), 0.9 * max(min(c.x, min(c.y, c.z)), 0.0));
+            c = max((c - veil) / t, vec3<f32>(0.0));
+        } else if (dz > 0.0) {
             let t = max(1.0 - 0.95 * min(dz, 1.0) * d, 0.12);
             c = max((c - air * (1.0 - t)) / t, vec3<f32>(0.0));
         } else {

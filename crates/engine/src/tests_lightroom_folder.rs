@@ -155,32 +155,24 @@ fn odd_folders_never_fail_the_check() {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        // file systems that only store UTF-8 names (APFS, the macOS default) refuse these, so there
-        // is nothing non-UTF-8 to come across and only the symlink checks below apply
-        let bad = root.join(std::ffi::OsStr::from_bytes(b"caf\xe9 Previews.lrdata"));
-        let made = match std::fs::create_dir_all(&bad) {
-            Ok(()) => true,
-            // (the file system rejects the name: EILSEQ on macOS)
-            Err(e)
-                if (cfg!(target_os = "macos") && e.raw_os_error() == Some(92))
-                    || matches!(e.kind(), std::io::ErrorKind::InvalidFilename | std::io::ErrorKind::InvalidInput) =>
-            {
-                false
-            }
-            Err(e) => panic!("cannot create {bad:?}: {e}"),
-        };
-        if made {
+        // APFS (macOS) refuses names that are not valid UTF-8 (EILSEQ): there the non-UTF-8 cases are skipped and
+        // the symlink cases below still run on a plain-named catalog folder
+        let probe = root.join(std::ffi::OsStr::from_bytes(b"\xff"));
+        let utf8_only = std::fs::create_dir(&probe).is_err();
+        let _ = std::fs::remove_dir(&probe);
+        if !utf8_only {
+            let bad = root.join(std::ffi::OsStr::from_bytes(b"caf\xe9 Previews.lrdata"));
+            std::fs::create_dir_all(&bad).unwrap();
             std::fs::write(root.join("Cat.lrcat"), b"x").unwrap();
             assert_eq!(lightroom_catalog_at(&bad), Some(LightroomPlace { catalog: Some(root.join("Cat.lrcat")) }), "non-UTF-8 name");
-            let odd = root.join(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
-            std::fs::create_dir_all(&odd).unwrap();
-            std::fs::write(odd.join(std::ffi::OsStr::from_bytes(b"\xff.lrcat")), b"x").unwrap();
-            std::fs::write(odd.join("b.lrcat"), b"x").unwrap();
-            assert_eq!(lightroom_catalog_at(&odd), Some(LightroomPlace { catalog: Some(odd.join("b.lrcat")) }), "non-UTF-8 entries skipped");
         }
-        let lr = root.join("catalogs");
+        let lr = root.join(if utf8_only { std::ffi::OsStr::new("lr") } else { std::ffi::OsStr::from_bytes(b"\xff\xfe") });
         std::fs::create_dir_all(&lr).unwrap();
+        if !utf8_only {
+            std::fs::write(lr.join(std::ffi::OsStr::from_bytes(b"\xff.lrcat")), b"x").unwrap();
+        }
         std::fs::write(lr.join("b.lrcat"), b"x").unwrap();
+        assert_eq!(lightroom_catalog_at(&lr), Some(LightroomPlace { catalog: Some(lr.join("b.lrcat")) }), "non-UTF-8 entries skipped");
         // a symlink to a catalog folder is one too; a dangling one is not
         std::os::unix::fs::symlink(&lr, root.join("link")).unwrap();
         assert!(lightroom_catalog_at(&root.join("link")).is_some());

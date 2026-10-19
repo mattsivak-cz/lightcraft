@@ -22,7 +22,7 @@ const MODULES: &[Module] = &[
             ("base_p", false, "f32"),
             ("clar", false, "f32"),
             ("tex", false, "f32"),
-            // V1 / V2: the dehaze dark plane; V3: the haze map's a / b coefficients (`HAS_HAZE`)
+            // V1 / V2: the dehaze dark plane; V4: the haze map's a / b coefficients (`HAS_HAZE`)
             ("dark", false, "f32"),
             ("masks", false, "f32"),
             ("aux", false, "f32"),
@@ -33,7 +33,7 @@ const MODULES: &[Module] = &[
     Module {
         src: include_str!("wgsl/blur.wgsl"),
         bindings: &[("src", false, "f32"), ("dst", true, "f32")],
-        entries: &["box_h", "box_v", "median_h", "median_v"],
+        entries: &["box_h", "box_v", "median_h", "median_v", "min_h", "min_v"],
     },
     Module {
         src: include_str!("wgsl/resize.wgsl"),
