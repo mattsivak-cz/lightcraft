@@ -223,8 +223,11 @@ impl Rgb32f {
     /// Bilinear sample at continuous pixel coordinates (pixel centres at +0.5).
     #[inline]
     pub fn sample_bilinear(&self, x: f32, y: f32) -> [f32; 3] {
-        let fx = x - 0.5;
-        let fy = y - 0.5;
+        // a pixel past the edge reads the edge pixel, so a coordinate held a pixel outside gives
+        // the same sample; an infinite one (a crop of no size's inverse mapping) then reads the
+        // edge too, instead of a NaN weight and a neighbour index past isize::MAX
+        let fx = x.clamp(-1.0, self.width as f32 + 1.0) - 0.5;
+        let fy = y.clamp(-1.0, self.height as f32 + 1.0) - 0.5;
         let x0 = fx.floor();
         let y0 = fy.floor();
         let tx = fx - x0;
@@ -274,6 +277,30 @@ impl Rgba8 {
 mod tests {
     use super::*;
     use lightcraft_geom::Orientation;
+
+    /// A sample at an infinite coordinate (the inverse mapping of a crop of no size) cast to
+    /// isize::MAX, and its right / lower neighbour overflowed (a panic where overflow is checked):
+    /// the neighbours saturate and the edge pixel comes back.
+    #[test]
+    fn bilinear_samples_at_infinite_coordinates_read_the_edge() {
+        let img = Rgb32f::from_fn(3, 2, |x, y| [x as f32, y as f32, 1.0]);
+        assert_eq!(img.sample_bilinear(f32::INFINITY, f32::INFINITY), [2.0, 1.0, 1.0]);
+        assert_eq!(img.sample_bilinear(f32::MAX, 0.0), [2.0, 0.0, 1.0]);
+        assert_eq!(img.sample_bilinear(f32::NEG_INFINITY, f32::NEG_INFINITY), [0.0, 0.0, 1.0]);
+        assert_eq!(img.sample_bilinear(1.5, 0.5), [1.0, 0.0, 1.0], "an ordinary sample is as before");
+    }
+
+    #[test]
+    fn transpose_swaps_the_axes() {
+        let p = Plane::from_fn(5, 3, |x, y| (y * 10 + x) as f32);
+        let t = p.transpose();
+        assert_eq!((t.width, t.height), (3, 5));
+        assert!((0..3).all(|y| (0..5).all(|x| t.get(y, x) == p.get(x, y))));
+        assert_eq!(t.transpose(), p);
+        // a buffer shorter than its size reads as zero where it runs out, never a panic
+        let short = Plane { width: 3, height: 2, data: vec![1.0; 4] };
+        assert_eq!(short.transpose().data, [1.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
+    }
 
     #[test]
     fn crop_and_rotate() {
