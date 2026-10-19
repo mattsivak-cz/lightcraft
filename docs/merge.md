@@ -108,7 +108,7 @@ scale in `BaselineExposure`; raw sources keep their DNG colour tags (camera RGB)
   per pixel), each turned ≤ 0.11° and moved by a fraction of a pixel, the brightest over half clipped. Alignment
   corner error 0.014 and 0.11 px, 98.8 % of the scene's detail kept; before the refinement and the Lanczos-3 warp
   0.43 and 6.2 px (the bright frame wasn't aligned) and 86 %. Measured with `metrics.rs` (`detail`, `detail_ratio`,
-  `MaxDetail` for focus stacks, `residual`).
+  `detail_gain`, `residual`).
 - Real handheld bracket (Sony, 33 MP, gravel a few metres away, a building ~1 km off; `tests/real_bracket.rs`, run
   by hand): the global fit, dominated by the foreground, left the building 2.3 px off (median; 95th percentile
   3.0 px) and the merge doubled its inscription; with local alignment 0.20 px (0.43 px), the whole frame 0.13 px.
