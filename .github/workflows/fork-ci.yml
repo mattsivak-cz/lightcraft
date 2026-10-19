@@ -1,4 +1,7 @@
-# CI for the mattsivak/lightcraft fork: the same gate as `cargo xtask ci`, run on GitHub instead of locally.
+# CI for the mattsivak-cz/lightcraft fork: the same gate as `cargo xtask ci`, run on GitHub instead of locally.
+# Branches live on the personal fork (mattsivak/lightcraft, where the upstream PRs come from); the
+# pre-push hook mirrors each pushed branch to this org fork and runs CI here, because only an
+# organization can use third-party runners (Depot).
 #
 # Feature branches are cut from upstream main, which has no CI workflow, and GitHub runs a `push`
 # workflow from the pushed branch's own tree. So this workflow lives on the fork's `fork-ci` branch
@@ -6,7 +9,7 @@
 # `workflow_dispatch --ref fork-ci`, passing the branch to test; it checks that branch out. The local
 # `pre-push` hook (`.github/fork-ci/pre-push`, installed by `.github/fork-ci/install-hook.sh`)
 # dispatches it after every push to the fork. By hand:
-#   gh workflow run fork-ci.yml -R mattsivak/lightcraft --ref fork-ci -f ref=<branch>
+#   gh workflow run fork-ci.yml -R mattsivak-cz/lightcraft --ref fork-ci -f ref=<branch>
 # The result is posted as a `fork-ci` commit status on the tested commit (visible on the fork's
 # branch and commit pages) and as a run named after the branch in the fork's Actions tab.
 #
@@ -19,7 +22,8 @@
 # - Windows is non-blocking (`continue-on-error`): upstream main fails 9 Windows-only tests
 #   (tests_export same_folder_as_original, tests_folder_drop: path separators / 8.3 temp names).
 #   Its failures still show in the run; drop `allow-failure` once upstream fixes them.
-# Standard GitHub-hosted runners only (free for a public repository).
+# The Linux gate runs on a Depot runner (depot-ubuntu-24.04: needs the Depot GitHub app on the
+# mattsivak-cz org); the small bookkeeping jobs, macOS and Windows use standard GitHub-hosted runners.
 name: Fork CI
 run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}"
 
@@ -95,7 +99,7 @@ jobs:
   linux:
     name: Linux x86_64 (xtask ci)
     needs: resolve
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 120
     env:
       CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
