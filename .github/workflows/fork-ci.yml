@@ -16,8 +16,9 @@
 # One job: `cargo xtask ci` (fmt, clippy, heif, tests, parity, layers, assets, wasm) on Linux with the
 # craft-fonts input, on a Depot runner (depot-ubuntu-24.04: needs the Depot GitHub app on the
 # mattsivak-cz org). The runner has no GPU, so the GPU tests skip; macOS and Windows aren't tested.
-# A dispatch can pick another runner (`-f runner=blacksmith-2vcpu-ubuntu-2404`, needs the Blacksmith
-# app on the org) to compare; such a run has its own concurrency group and posts `fork-ci (<runner>)`.
+# A dispatch can pick another runner: a bigger Depot VM (`-f runner=depot-ubuntu-24.04-8`, the suffix is
+# the vCPU count) or Blacksmith (`-f runner=blacksmith-8vcpu-ubuntu-2404`, needs its app on the org);
+# such a run has its own concurrency group and posts `fork-ci (<runner>)`.
 name: Fork CI
 run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}${{ inputs.runner && inputs.runner != 'depot-ubuntu-24.04' && format(' on {0}', inputs.runner) || '' }}"
 
@@ -38,7 +39,17 @@ on:
       runner:
         description: "Runner label"
         type: choice
-        options: [depot-ubuntu-24.04, blacksmith-2vcpu-ubuntu-2404, blacksmith-4vcpu-ubuntu-2404]
+        options:
+          - depot-ubuntu-24.04
+          - depot-ubuntu-24.04-4
+          - depot-ubuntu-24.04-8
+          - depot-ubuntu-24.04-16
+          - depot-ubuntu-24.04-32
+          - depot-ubuntu-24.04-64
+          - blacksmith-2vcpu-ubuntu-2404
+          - blacksmith-4vcpu-ubuntu-2404
+          - blacksmith-8vcpu-ubuntu-2404
+          - blacksmith-16vcpu-ubuntu-2404
         default: depot-ubuntu-24.04
 
 # A newer push of the same branch cancels the older run on the same runner.
