@@ -736,7 +736,8 @@ mod tests {
         let fresh = |src: &Rgb32f, frame: &Frame| {
             let mut img = frame.sample(src, 48, 32);
             white_balance(&mut img, &info, &s);
-            airlight(&gaussian(&img.map(dark_of), (0.02 * frame.px_per_long(48)).max(1.0) as f32))
+            let ppl = frame.px_per_long(48);
+            airlight(&dark_plane(&img, (0.02 * ppl).max(1.0) as f32, dehaze_patch_radius(&s, ppl)))
         };
         let frame = crate::frame_for(&hazy, &info, &s, true);
         let kept = frame_proxy(&hazy, &frame, 48, 32);
