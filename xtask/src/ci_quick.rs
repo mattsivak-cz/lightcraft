@@ -66,18 +66,22 @@ pub fn plan(changed: &[Changed], packages: &[(String, String)], base: String) ->
         if PARITY_DOCS.contains(&path) || c.gone {
             p.parity = true;
         }
-        // the innermost package directory containing the file
-        let owner = packages
-            .iter()
-            .filter(|(_, dir)| !dir.is_empty() && path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/')))
-            .max_by_key(|(_, dir)| dir.len());
-        if let Some((name, _)) = owner {
-            p.packages.insert(name.clone());
+        if let Some(name) = owner(path, packages) {
+            p.packages.insert(name.to_owned());
         }
     }
     p.heif = p.workspace_wide || HEIF_PACKAGES.iter().any(|h| p.packages.contains(*h));
     p.parity |= p.workspace_wide || PARITY_PACKAGES.iter().any(|h| p.packages.contains(*h));
     p
+}
+
+/// The package whose directory (the innermost one) contains `path`.
+pub fn owner<'a>(path: &str, packages: &'a [(String, String)]) -> Option<&'a str> {
+    packages
+        .iter()
+        .filter(|(_, dir)| !dir.is_empty() && path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/')))
+        .max_by_key(|(_, dir)| dir.len())
+        .map(|(name, _)| name.as_str())
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
