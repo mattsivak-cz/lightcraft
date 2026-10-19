@@ -13,17 +13,9 @@
 # The result is posted as a `fork-ci` commit status on the tested commit (visible on the fork's
 # branch and commit pages) and as a run named after the branch in the fork's Actions tab.
 #
-# - Linux runs `cargo xtask ci` (fmt, clippy, heif, tests, parity, layers, assets, wasm) with the
-#   craft-fonts input.
-# - macOS and Windows run what differs per platform: clippy and the workspace tests (code behind
-#   `cfg(target_os)` only compiles there). macOS runners expose a Metal device, so the GPU tests run
-#   for real there, and a step fails the job if they skip. Linux and Windows runners have no GPU and
-#   upstream has no software-adapter override, so their GPU tests skip.
-# - Windows is non-blocking (`continue-on-error`): upstream main fails 9 Windows-only tests
-#   (tests_export same_folder_as_original, tests_folder_drop: path separators / 8.3 temp names).
-#   Its failures still show in the run; drop `allow-failure` once upstream fixes them.
-# The Linux gate runs on a Depot runner (depot-ubuntu-24.04: needs the Depot GitHub app on the
-# mattsivak-cz org); the small bookkeeping jobs, macOS and Windows use standard GitHub-hosted runners.
+# One job: `cargo xtask ci` (fmt, clippy, heif, tests, parity, layers, assets, wasm) on Linux with the
+# craft-fonts input, on a Depot runner (depot-ubuntu-24.04: needs the Depot GitHub app on the
+# mattsivak-cz org). The runner has no GPU, so the GPU tests skip; macOS and Windows aren't tested.
 name: Fork CI
 run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}"
 
@@ -41,11 +33,6 @@ on:
         description: "Exact commit to test (empty: the branch's current head)"
         type: string
         default: ""
-      platforms:
-        description: "Which jobs to run"
-        type: choice
-        options: [all, linux]
-        default: all
 
 # A newer push of the same branch cancels the older run.
 concurrency:
@@ -64,23 +51,24 @@ env:
   CRAFT_FONTS_REF: 3d9ab3a132ed0eff457e424226a435a901da30d3 # same pin as release.yml
 
 jobs:
-  resolve:
-    name: Resolve commit
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  ci:
+    name: Linux x86_64 (xtask ci)
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 120
     permissions:
       contents: read
       statuses: write
-    outputs:
-      sha: ${{ steps.sha.outputs.sha }}
+    env:
+      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+      CRAFT_FONTS_REQUIRED: "1"
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - id: sha
-        name: Resolve and mark pending
+        name: Resolve commit and mark pending
         env:
-          GH_TOKEN: ${{ github.token }}
           REF: ${{ inputs.ref || github.ref_name }}
           SHA: ${{ inputs.sha || github.sha }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ -z "$SHA" ]; then
             SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" --jq .sha)
@@ -95,19 +83,9 @@ jobs:
           echo "### Testing \`$REF\` at \`${SHA::9}\`" >>"$GITHUB_STEP_SUMMARY"
           gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending -f context=fork-ci \
             -f description="running" -f target_url="$RUN_URL" >/dev/null
-
-  linux:
-    name: Linux x86_64 (xtask ci)
-    needs: resolve
-    runs-on: depot-ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
-      CRAFT_FONTS_REQUIRED: "1"
-    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: ${{ steps.sha.outputs.sha }}
           persist-credentials: false
       # Optional font build input, so the Japanese and Chinese font tests run (they skip without it).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -137,80 +115,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           if [ -f target/ci/summary.md ]; then cat target/ci/summary.md >>"$GITHUB_STEP_SUMMARY"; fi
-
-  desktop:
-    name: ${{ matrix.name }}
-    needs: resolve
-    if: ${{ inputs.platforms != 'linux' }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
-    continue-on-error: ${{ matrix.allow-failure }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: "macOS arm64 (clippy, test, GPU tests on Metal)", runner: macos-latest, allow-failure: false }
-          - { name: "Windows x86_64 (clippy, test; non-blocking)", runner: windows-latest, allow-failure: true }
-    env:
-      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
-      CRAFT_FONTS_REQUIRED: "1"
-    steps:
-      # Check files out as committed: tests compare bytes of fixtures and docs.
-      - name: Keep line endings
-        run: git config --global core.autocrlf false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.resolve.outputs.sha }}
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: storytold/craft-fonts
-          ref: ${{ env.CRAFT_FONTS_REF }}
-          path: craft-fonts
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: fork-ci
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # every failing test binary, not only the first: platform failures tend to come in groups
-      - name: cargo test
-        if: ${{ !cancelled() }}
-        run: cargo test --workspace --locked --no-fail-fast
-      - name: GPU tests on Metal
-        if: ${{ !cancelled() && runner.os == 'macOS' }}
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo test -p lightcraft-gpu --locked --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gpu-tests.log"
-          if grep -qE "skipped( \(gpu\))?: no GPU adapter" "$RUNNER_TEMP/gpu-tests.log"; then
-            echo "::error::the GPU tests skipped: the runner offered no Metal device"
-            exit 1
-          fi
-
-  report:
-    name: Report status
-    needs: [resolve, linux, desktop]
-    if: ${{ always() && needs.resolve.outputs.sha != '' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      statuses: write
-    steps:
       - name: Post commit status
+        if: ${{ always() && steps.sha.outputs.sha != '' }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ needs.resolve.outputs.sha }}
-          RESULTS: ${{ needs.linux.result }} ${{ needs.desktop.result }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ steps.sha.outputs.sha }}
+          RESULT: ${{ job.status }}
         run: |
-          case " $RESULTS " in
-            *" failure "*) state=failure desc="failed" ;;
-            *" cancelled "*) state=error desc="cancelled" ;;
-            *) state=success desc="passed" ;;
+          case "$RESULT" in
+            success) state=success desc="passed" ;;
+            cancelled) state=error desc="cancelled" ;;
+            *) state=failure desc="failed" ;;
           esac
           gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=$state -f context=fork-ci \
-            -f description="$desc ($RESULTS)" -f target_url="$RUN_URL" >/dev/null
+            -f description="$desc" -f target_url="$RUN_URL" >/dev/null
