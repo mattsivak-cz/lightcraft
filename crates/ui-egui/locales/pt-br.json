@@ -2206,5 +2206,11 @@
   "the free-space check stopped unexpectedly": "A verificação do espaço livre parou inesperadamente.",
   "Smart Preview Format": "Formato das pré-visualizações inteligentes",
   "Checking free space…": "Verificando o espaço livre…",
-  "Build": "Gerar"
+  "Build": "Gerar",
+  "Include selected photos": "Incluir fotos selecionadas",
+  "Color Overlay": "Sobreposição de cor",
+  "Color Overlay on B&W": "Sobreposição de cor em P&B",
+  "Image on Black": "Imagem sobre preto",
+  "Image on White": "Imagem sobre branco",
+  "White on Black": "Branco sobre preto"
 }

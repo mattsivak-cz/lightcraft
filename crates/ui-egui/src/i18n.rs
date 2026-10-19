@@ -800,6 +800,12 @@ mod tests {
         });
     }
 
+    /// Symbols a translation must not carry, because the craft-fonts faces of at least one shipped
+    /// script have no glyph for them and egui's bundled fonts do not either: the menu triangles,
+    /// and the heavy multiplication X (U+2715) that Noto Sans Georgian lacks — `×` (U+00D7) reads
+    /// the same and every face has it.
+    const UNPAINTABLE: [char; 3] = ['▸', '▾', '✕'];
+
     #[test]
     fn translated_catalogs_do_not_use_missing_menu_triangles() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
@@ -816,7 +822,10 @@ mod tests {
                     _ => panic!("invalid translation: {source:?}"),
                 };
                 for text in forms {
-                    assert!(!text.as_str().unwrap().contains(['▸', '▾']), "{}: {source:?} uses an unpaintable menu triangle", path.display());
+                    let text = text.as_str().unwrap();
+                    for bad in UNPAINTABLE {
+                        assert!(!text.contains(bad), "{}: {source:?} uses the unpaintable {bad:?}", path.display());
+                    }
                 }
             }
         }
