@@ -279,6 +279,27 @@ fn constants() -> String {
     s
 }
 
+/// Every parameter field a kernel reads (`F_NAME`) is in the block (`params::FIELDS`): a missing one
+/// fails the kernel's compile, which only a machine with a GPU would notice.
+#[cfg(test)]
+#[test]
+fn kernels_read_only_declared_fields() {
+    let consts = constants();
+    for m in MODULES {
+        let mut rest = m.src;
+        while let Some(at) = rest.find("F_") {
+            let tail = &rest[at..];
+            let len = tail.find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')).unwrap_or(tail.len());
+            let name = &tail[..len];
+            let word_start = rest[..at].chars().next_back().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+            if word_start && len > 2 {
+                assert!(consts.contains(&format!("const {name}: u32")), "{name} is read by a kernel but not declared");
+            }
+            rest = &tail[len.max(2)..];
+        }
+    }
+}
+
 fn module_source(m: &Module, consts: &str) -> String {
     let mut s = String::from(consts);
     s += "@group(0) @binding(0) var<storage, read> P: array<u32>;\n";
