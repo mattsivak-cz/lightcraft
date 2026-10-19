@@ -1,15 +1,19 @@
 #!/bin/sh
 # git pre-push hook: after a push to the mattsivak/lightcraft fork, mirror every pushed branch to the
-# mattsivak-cz/lightcraft org fork and start .github/workflows/fork-ci.yml there (on its fork-ci
-# branch). CI runs in the org fork because only an organization can use Depot runners; the personal
-# fork stays the home of the branches and the upstream PRs. Install with .github/fork-ci/install-hook.sh.
+# mattsivak-cz/lightcraft org fork, and with FORK_CI=1 also start .github/workflows/fork-ci.yml there
+# (on its fork-ci branch). CI runs in the org fork because only an organization can use Depot
+# runners; the personal fork stays the home of the branches and the upstream PRs. CI is opt-in per
+# push because each run bills Depot minutes. Install with .github/fork-ci/install-hook.sh.
 #
 # Never blocks or fails the push: it forks a background job that waits until the pushed commit is on
-# GitHub, mirrors it, then dispatches the workflow. Log: $(git rev-parse --git-common-dir)/fork-ci.log.
-# Opt out for one push: FORK_CI=0 git push ...
+# GitHub, mirrors it, then (FORK_CI=1) dispatches the workflow. Log: $(git rev-parse --git-common-dir)/fork-ci.log.
+#   git push ...             mirror only
+#   FORK_CI=1 git push ...   mirror and run CI
+#   FORK_CI=0 git push ...   neither
 
 remote_url=$2
-[ "${FORK_CI:-1}" = 0 ] && exit 0
+[ "${FORK_CI:-}" = 0 ] && exit 0
+run_ci=${FORK_CI:-}
 case "$remote_url" in
   *github.com[:/]mattsivak/lightcraft|*github.com[:/]mattsivak/lightcraft.git) ;;
   *) exit 0 ;;
@@ -34,6 +38,10 @@ while read -r _local_ref local_sha remote_ref _remote_sha; do
         # the CI fork is a mirror: force, so rebased branches follow
         if ! FORK_CI=0 git push --quiet --no-verify --force "$ci_url" "$local_sha:$remote_ref"; then
           echo "$(date '+%F %T') FAILED to mirror $branch @ $local_sha to $repo"
+          exit 0
+        fi
+        if [ "$run_ci" != 1 ]; then
+          echo "$(date '+%F %T') mirrored $branch @ $local_sha to $repo (no CI run: FORK_CI=1 starts one)"
           exit 0
         fi
         if gh workflow run fork-ci.yml -R "$repo" --ref fork-ci -f ref="$branch" -f sha="$local_sha" >/dev/null 2>&1; then

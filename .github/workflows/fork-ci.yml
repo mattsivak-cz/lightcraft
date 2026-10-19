@@ -1,6 +1,6 @@
 # CI for the mattsivak-cz/lightcraft fork: the same gate as `cargo xtask ci`, run on GitHub instead of locally.
 # Branches live on the personal fork (mattsivak/lightcraft, where the upstream PRs come from); the
-# pre-push hook mirrors each pushed branch to this org fork and runs CI here, because only an
+# pre-push hook mirrors each pushed branch to this org fork and CI runs here, because only an
 # organization can use third-party runners (Depot).
 #
 # Feature branches are cut from upstream main, which has no CI workflow, and GitHub runs a `push`
@@ -8,7 +8,7 @@
 # (never on main, which stays a plain mirror of upstream) and is started per branch with
 # `workflow_dispatch --ref fork-ci`, passing the branch to test; it checks that branch out. The local
 # `pre-push` hook (`.github/fork-ci/pre-push`, installed by `.github/fork-ci/install-hook.sh`)
-# dispatches it after every push to the fork. By hand:
+# mirrors every pushed branch here, and starts a run only for `FORK_CI=1 git push`. By hand:
 #   gh workflow run fork-ci.yml -R mattsivak-cz/lightcraft --ref fork-ci -f ref=<branch>
 # The result is posted as a `fork-ci` commit status on the tested commit (visible on the fork's
 # branch and commit pages) and as a run named after the branch in the fork's Actions tab.
@@ -22,10 +22,8 @@
 name: Fork CI
 run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}${{ inputs.runner && inputs.runner != 'depot-ubuntu-24.04' && format(' on {0}', inputs.runner) || '' }}"
 
+# Manual only: nothing starts it automatically (each run bills Depot minutes).
 on:
-  # changes to this workflow test themselves on the fork-ci branch
-  push:
-    branches: [fork-ci]
   workflow_dispatch:
     inputs:
       ref:
@@ -52,7 +50,7 @@ on:
           - blacksmith-16vcpu-ubuntu-2404
         default: depot-ubuntu-24.04
 
-# A newer push of the same branch cancels the older run on the same runner.
+# A newer run of the same branch cancels the older run on the same runner.
 concurrency:
   group: fork-ci-${{ inputs.ref || github.ref_name }}-${{ inputs.runner || 'depot-ubuntu-24.04' }}
   cancel-in-progress: true
