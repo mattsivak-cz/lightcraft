@@ -56,7 +56,7 @@ Beta-blocking gaps (B) total **~230–430 h**; with the stability and platform w
 - **File format:** 2, 6, 7, 10, 13, 20, 25 (raw ones in [raw-parity.md](raw-parity.md))
 - **Hardware:** 14, 17, 22, 27
 - **Localization:** 21
-- **Quality / fidelity:** 1, 3, 29
+- **Quality / fidelity:** 1, 3, 30
 - **Stability and platforms:** 9, 26, 27
 
 ## Closed recently (kept for calibration)

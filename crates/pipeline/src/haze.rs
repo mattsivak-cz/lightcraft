@@ -603,6 +603,17 @@ pub fn cache_bytes() -> usize {
 /// Drop every map [`for_frame`] keeps (the next render of a dehazed V4 photo builds its map again).
 pub fn clear_cache() {
     cache().0.clear();
+    CLEARS.with(|n| n.set(n.get().wrapping_add(1)));
+}
+
+std::thread_local! {
+    static CLEARS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread called [`clear_cache`]: lets a caller's tests check when it drops
+/// the maps although other tests share the cache (and clear it) in parallel.
+pub fn clears_on_this_thread() -> u64 {
+    CLEARS.with(std::cell::Cell::get)
 }
 
 /// The haze map of `src` developed with `s` through `frame` (the whole output frame, before any

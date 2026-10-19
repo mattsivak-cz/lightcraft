@@ -928,18 +928,14 @@ impl Renderer {
     /// Clear stage caches, least useful first, until what they hold fits [`Self::stage_budget`].
     fn trim_stages(&mut self) {
         let sizes: Vec<(Slot, usize)> = self.stages.iter().map(|(slot, c)| (*slot, c.bytes() + lightcraft_engine::gpu::stage_bytes(c))).collect();
-        let mut trimmed = false;
         for slot in stage_trim_order(&sizes, self.stage_budget()) {
             if let Some(c) = self.stages.get(&slot) {
                 c.clear();
                 self.stages_trimmed += 1;
-                trimmed = true;
             }
         }
-        // (V4's haze maps are cached per photo, outside the views' stage caches)
-        if trimmed {
-            lightcraft_pipeline::haze::clear_cache();
-        }
+        // (V4's haze maps stay: their cache is bounded on its own, `haze::CACHE_KEEP` maps of a few
+        // MB, and holds the open photo's, which its next render would otherwise rebuild)
     }
 
     /// What the renderer holds: per-view stage caches (CPU images and GPU buffers) and textures.
@@ -1617,6 +1613,28 @@ mod stage_budget_tests {
         assert!(r.stages[&Slot::Main].bytes() > 0, "the open photo's view is never trimmed");
         r.trim_stages();
         assert_eq!(r.stages_trimmed, 1, "and nothing is trimmed again");
+    }
+
+    // Trimming the views' stage caches keeps V4's haze maps (bounded on their own, and the open
+    // photo's would be rebuilt on its next render); forgetting everything drops them
+    #[test]
+    fn trimming_stage_caches_keeps_the_haze_maps() {
+        use lightcraft_engine::pipeline::{RenderRequest, SourceInfo, render_cached};
+        use lightcraft_pipeline::haze::clears_on_this_thread;
+        let src = std::sync::Arc::new(lightcraft_raster::Rgb32f::from_fn(320, 240, |x, y| [x as f32 / 320.0, y as f32 / 240.0, 0.3]));
+        let mut r = Renderer::default();
+        let cache: Arc<StageCache> = Default::default();
+        let mut s = lightcraft_engine::develop::DevelopSettings::default();
+        s.effects.clarity = 50.0;
+        render_cached(&src, &SourceInfo::default(), &s, &RenderRequest::fit(320, 240), &cache);
+        r.stages.insert(Slot::Hover, cache);
+        r.stage_budget_override = Some(0);
+        let before = clears_on_this_thread();
+        r.trim_stages();
+        assert_eq!(r.stages_trimmed, 1, "the hover render's cache went");
+        assert_eq!(clears_on_this_thread(), before, "the haze maps stayed");
+        r.forget_all();
+        assert_eq!(clears_on_this_thread(), before + 1, "forgetting everything drops them");
     }
 
     // The renderer counts and trims what it holds, and says so

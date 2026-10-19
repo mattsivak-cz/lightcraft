@@ -431,11 +431,21 @@ fn v4_haze_map_follows_what_it_depends_on() {
     assert!(*map(&brighter, &info, &base, &req) != *m0, "other pixels give another map");
     // a drag: the white balance's draft reuses the map, the final render builds its own
     let draft = RenderRequest { quality: crate::Quality::Draft, ..req };
-    let mut dragged = base.clone();
-    (dragged.wb.mode, dragged.wb.temp) = (WbMode::Custom, 6100.0);
-    let m1 = map(&src, &info, &base, &req);
-    assert!(Arc::ptr_eq(&map(&src, &info, &dragged, &draft), &m1), "a draft reuses the photo's latest map");
-    assert!(*map(&src, &info, &dragged, &req) != *m1, "the final render builds the exact map");
+    let drag = |temp: f64| {
+        let mut s = base.clone();
+        (s.wb.mode, s.wb.temp) = (WbMode::Custom, temp);
+        s
+    };
+    let dragged = drag(6100.0);
+    // (by value, and again with another tick if it missed: other tests share the process-wide
+    // cache and may evict the photo's map between the two plans; a miss caches that tick's own
+    // map; a draft that never reuses the photo's misses every time)
+    let reused = [6100.0, 6200.0, 6300.0].into_iter().any(|temp| {
+        let m1 = map(&src, &info, &base, &req);
+        *map(&src, &info, &drag(temp), &draft) == *m1
+    });
+    assert!(reused, "a draft reuses the photo's latest map");
+    assert!(*map(&src, &info, &dragged, &req) != *m0, "the final render builds the exact map");
 }
 
 /// The map is measured on the pixels it is applied to: with the camera's local tone mapping (a
