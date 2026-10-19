@@ -202,6 +202,60 @@ fn total_ram_gb() -> Option<u64> {
     Some(bytes.saturating_add(1 << 29) >> 30)
 }
 
+/// `ci --quick`'s tests: build every workspace test target, then run only the test binaries of
+/// `packages`. Building with `-p` instead would resolve features per selection: different
+/// artifacts from `ci`'s and a warm worktree's (`cargo xtask warm`) workspace builds, so it would
+/// recompile ~130 crates. Doc tests are left to the full `ci`.
+fn test_selected(root: &Path, packages: &std::collections::BTreeSet<String>, skip_log: &Path) -> Result<(), String> {
+    let manifests: std::collections::BTreeMap<String, String> = metadata()?["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| Some((p["manifest_path"].as_str()?.to_owned(), p["name"].as_str()?.to_owned())))
+        .filter(|(_, name)| packages.contains(name))
+        .collect();
+    let what = "cargo test --workspace --no-run";
+    eprintln!("$ {what} (then the test binaries of {})", packages.iter().map(String::as_str).collect::<Vec<_>>().join(", "));
+    let out = cargo()
+        .args(["test", "--workspace", "--no-run", "--message-format=json-render-diagnostics"])
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| format!("{what}: failed to spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{what}: exited with {}", out.status));
+    }
+    let mut binaries = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if msg["reason"] != "compiler-artifact" || msg["profile"]["test"] != true {
+            continue;
+        }
+        let (Some(exe), Some(manifest)) = (msg["executable"].as_str(), msg["manifest_path"].as_str()) else { continue };
+        if let Some(name) = manifests.get(manifest) {
+            binaries.push((name.clone(), manifest.to_owned(), exe.to_owned()));
+        }
+    }
+    if binaries.is_empty() {
+        println!("no test binaries in {}", packages.iter().map(String::as_str).collect::<Vec<_>>().join(", "));
+        return Ok(());
+    }
+    let mut failed = Vec::new();
+    for (name, manifest, exe) in &binaries {
+        let dir = Path::new(manifest).parent().unwrap_or(root);
+        let mut c = Command::new(exe);
+        c.current_dir(dir).env("CARGO_MANIFEST_DIR", dir).env("CARGO_PKG_NAME", name).env(ci_report::SKIP_LOG_ENV, skip_log);
+        if std::env::var_os("RUST_TEST_THREADS").is_none() {
+            // as the cargo runs of ci (`cargo()`): more threads make the frame-budget tests flaky
+            c.env("RUST_TEST_THREADS", std::thread::available_parallelism().map_or(4, |n| n.get()).min(4).to_string());
+        }
+        let file = Path::new(exe).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        if run(c, &format!("{name}: {file}")).is_err() {
+            failed.push(format!("{name} ({file})"));
+        }
+    }
+    if failed.is_empty() { Ok(()) } else { Err(format!("tests failed in {}", failed.join(", "))) }
+}
+
 pub fn run(mut cmd: Command, what: &str) -> Result<(), String> {
     eprintln!("$ {what}");
     let status = cmd.status().map_err(|e| format!("{what}: failed to spawn: {e}"))?;
@@ -359,11 +413,6 @@ fn cmd_ci(args: &[&str]) -> Result<(), String> {
             _ => true,
         },
     };
-    let mut test_args = vec!["test".to_owned()];
-    match &plan {
-        Some(p) if !p.workspace_wide => test_args.extend(p.packages.iter().flat_map(|n| ["-p".to_owned(), n.clone()])),
-        _ => test_args.push("--workspace".to_owned()),
-    }
     let mut steps: Vec<Step> = vec![
         (
             "fmt",
@@ -395,9 +444,9 @@ fn cmd_ci(args: &[&str]) -> Result<(), String> {
         ),
         (
             "test",
-            Box::new(|| {
-                let a: Vec<&str> = test_args.iter().map(String::as_str).collect();
-                test(&a, "test")
+            Box::new(|| match &plan {
+                Some(p) if !p.workspace_wide => test_selected(&root, &p.packages, &ci_report::skip_log(&root, "test")),
+                _ => test(&["test", "--workspace"], "test"),
             }),
         ),
     ];
