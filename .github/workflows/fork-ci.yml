@@ -16,8 +16,10 @@
 # One job: `cargo xtask ci` (fmt, clippy, heif, tests, parity, layers, assets, wasm) on Linux with the
 # craft-fonts input, on a Depot runner (depot-ubuntu-24.04: needs the Depot GitHub app on the
 # mattsivak-cz org). The runner has no GPU, so the GPU tests skip; macOS and Windows aren't tested.
+# A dispatch can pick another runner (`-f runner=blacksmith-2vcpu-ubuntu-2404`, needs the Blacksmith
+# app on the org) to compare; such a run has its own concurrency group and posts `fork-ci (<runner>)`.
 name: Fork CI
-run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}"
+run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}${{ inputs.runner && inputs.runner != 'depot-ubuntu-24.04' && format(' on {0}', inputs.runner) || '' }}"
 
 on:
   # changes to this workflow test themselves on the fork-ci branch
@@ -33,10 +35,15 @@ on:
         description: "Exact commit to test (empty: the branch's current head)"
         type: string
         default: ""
+      runner:
+        description: "Runner label"
+        type: choice
+        options: [depot-ubuntu-24.04, blacksmith-2vcpu-ubuntu-2404, blacksmith-4vcpu-ubuntu-2404]
+        default: depot-ubuntu-24.04
 
-# A newer push of the same branch cancels the older run.
+# A newer push of the same branch cancels the older run on the same runner.
 concurrency:
-  group: fork-ci-${{ inputs.ref || github.ref_name }}
+  group: fork-ci-${{ inputs.ref || github.ref_name }}-${{ inputs.runner || 'depot-ubuntu-24.04' }}
   cancel-in-progress: true
 
 permissions:
@@ -53,7 +60,7 @@ env:
 jobs:
   ci:
     name: Linux x86_64 (xtask ci)
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ inputs.runner || 'depot-ubuntu-24.04' }}
     timeout-minutes: 120
     permissions:
       contents: read
@@ -63,6 +70,7 @@ jobs:
       CRAFT_FONTS_REQUIRED: "1"
       GH_TOKEN: ${{ github.token }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      STATUS_CONTEXT: ${{ (inputs.runner && inputs.runner != 'depot-ubuntu-24.04') && format('fork-ci ({0})', inputs.runner) || 'fork-ci' }}
     steps:
       - id: sha
         name: Resolve commit and mark pending
@@ -81,7 +89,7 @@ jobs:
           SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA" --jq .sha)
           echo "sha=$SHA" >>"$GITHUB_OUTPUT"
           echo "### Testing \`$REF\` at \`${SHA::9}\`" >>"$GITHUB_STEP_SUMMARY"
-          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending -f context=fork-ci \
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending -f context="$STATUS_CONTEXT" \
             -f description="running" -f target_url="$RUN_URL" >/dev/null
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -126,5 +134,5 @@ jobs:
             cancelled) state=error desc="cancelled" ;;
             *) state=failure desc="failed" ;;
           esac
-          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=$state -f context=fork-ci \
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=$state -f context="$STATUS_CONTEXT" \
             -f description="$desc" -f target_url="$RUN_URL" >/dev/null
