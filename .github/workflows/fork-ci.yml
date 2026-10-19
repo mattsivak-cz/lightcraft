@@ -14,13 +14,13 @@
 # branch and commit pages) and as a run named after the branch in the fork's Actions tab.
 #
 # One job: `cargo xtask ci` (fmt, clippy, heif, tests, parity, layers, assets, wasm) on Linux with the
-# craft-fonts input, on a Depot runner (depot-ubuntu-24.04: needs the Depot GitHub app on the
-# mattsivak-cz org). The runner has no GPU, so the GPU tests skip; macOS and Windows aren't tested.
+# craft-fonts input, on a Depot runner (depot-ubuntu-24.04-16, 16 vCPU: needs the Depot GitHub app
+# on the mattsivak-cz org). The runner has no GPU, so the GPU tests skip; macOS and Windows aren't tested.
 # A dispatch can pick another runner: a bigger Depot VM (`-f runner=depot-ubuntu-24.04-8`, the suffix is
 # the vCPU count) or Blacksmith (`-f runner=blacksmith-8vcpu-ubuntu-2404`, needs its app on the org);
 # such a run has its own concurrency group and posts `fork-ci (<runner>)`.
 name: Fork CI
-run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}${{ inputs.runner && inputs.runner != 'depot-ubuntu-24.04' && format(' on {0}', inputs.runner) || '' }}"
+run-name: "CI ${{ inputs.ref || github.ref_name }}${{ inputs.sha && format(' @ {0}', inputs.sha) || '' }}${{ inputs.runner && inputs.runner != 'depot-ubuntu-24.04-16' && format(' on {0}', inputs.runner) || '' }}"
 
 # Manual only: nothing starts it automatically (each run bills Depot minutes).
 on:
@@ -48,11 +48,11 @@ on:
           - blacksmith-4vcpu-ubuntu-2404
           - blacksmith-8vcpu-ubuntu-2404
           - blacksmith-16vcpu-ubuntu-2404
-        default: depot-ubuntu-24.04
+        default: depot-ubuntu-24.04-16
 
 # A newer run of the same branch cancels the older run on the same runner.
 concurrency:
-  group: fork-ci-${{ inputs.ref || github.ref_name }}-${{ inputs.runner || 'depot-ubuntu-24.04' }}
+  group: fork-ci-${{ inputs.ref || github.ref_name }}-${{ inputs.runner || 'depot-ubuntu-24.04-16' }}
   cancel-in-progress: true
 
 permissions:
@@ -69,7 +69,7 @@ env:
 jobs:
   ci:
     name: Linux x86_64 (xtask ci)
-    runs-on: ${{ inputs.runner || 'depot-ubuntu-24.04' }}
+    runs-on: ${{ inputs.runner || 'depot-ubuntu-24.04-16' }}
     timeout-minutes: 120
     permissions:
       contents: read
@@ -79,7 +79,7 @@ jobs:
       CRAFT_FONTS_REQUIRED: "1"
       GH_TOKEN: ${{ github.token }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      STATUS_CONTEXT: ${{ (inputs.runner && inputs.runner != 'depot-ubuntu-24.04') && format('fork-ci ({0})', inputs.runner) || 'fork-ci' }}
+      STATUS_CONTEXT: ${{ (inputs.runner && inputs.runner != 'depot-ubuntu-24.04-16') && format('fork-ci ({0})', inputs.runner) || 'fork-ci' }}
     steps:
       - id: sha
         name: Resolve commit and mark pending
