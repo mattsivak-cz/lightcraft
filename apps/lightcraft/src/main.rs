@@ -90,8 +90,7 @@ impl eframe::App for App {
         }
         self.0.logic(ctx);
         self.1.tick(&mut self.0, ctx);
-        // for a device lost in the middle of a frame, when this app can't save any more (`main`)
-        UNSAVED_CHANGES.store(unsaved_changes(&self.0.session), std::sync::atomic::Ordering::Relaxed);
+        self.note_unsaved();
     }
     /// Forwards the host's raw-input pass to the app's hook before egui processes it, keeping
     /// modal/prompt input barriers and queued synthetic or dropped input ahead of the panels.
@@ -100,12 +99,7 @@ impl eframe::App for App {
     }
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.0.perf.host_frame_ms = frame.info().cpu_usage.map(|s| f64::from(s) * 1000.0);
-        // on a lost device, a frame with anything in it panics in egui-wgpu (its staging buffers
-        // can't be made): draw nothing until the restart (see `logic`)
-        if lightcraft_engine::gpu::window_device_lost() {
-            return;
-        }
-        self.0.ui(ui);
+        self.draw(ui);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // (closing the window went through `may_close`, which offers to keep unsaved changes)
@@ -124,6 +118,24 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The frame's UI pass. On a lost device, a frame with anything in it panics in egui-wgpu (its
+    /// staging buffers can't be made): draw nothing until the restart (see `logic`).
+    fn draw(&mut self, ui: &mut egui::Ui) {
+        if lightcraft_engine::gpu::window_device_lost() {
+            return;
+        }
+        self.0.ui(ui);
+        // (widgets run commands too: counted before the frame is painted, where the device can be lost)
+        self.note_unsaved();
+    }
+
+    /// For a device lost in the middle of a frame, when this app can't save any more (`main`):
+    /// how many changes couldn't be written to disk, as of the end of `logic` and of the UI pass,
+    /// the two places the session changes in a frame.
+    fn note_unsaved(&self) {
+        UNSAVED_CHANGES.store(unsaved_changes(&self.0.session), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Save settings and the library, then wait for background work: closing the window or Quit
     /// from the macOS menu bar (which must not end the process here, so the macOS exit stays in
     /// `on_exit`). Returns what [`App::save`] returns.
@@ -1518,6 +1530,32 @@ mod tests {
         assert!(session.execute("photo.rate", &serde_json::json!({"rating": 4})).is_err());
         assert_eq!(unsaved_changes(&session), 1);
         assert!(!relaunch_after_lost_frame(true, true, unsaved_changes(&session)));
+    }
+
+    /// PR #1240 review: the change count a device lost mid-frame decides by is the one at the
+    /// end of the frame's UI pass, where widgets run commands too, not the one `logic` saw before.
+    #[test]
+    fn a_change_that_fails_in_the_ui_pass_is_counted_before_the_frame_is_painted() {
+        let disk = FailingDisk::default();
+        let mut app = app_on(disk.session());
+        let ctx = egui::Context::default();
+        let pass = |app: &mut App| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+            out.textures_delta.clear();
+        };
+        pass(&mut app);
+        assert_eq!(UNSAVED_CHANGES.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // a widget's command the journal can't take, run after `logic` noted the count
+        disk.set_failing(true);
+        assert!(app.0.session.execute("photo.rate", &serde_json::json!({"rating": 5})).is_err());
+        pass(&mut app);
+        assert_eq!(UNSAVED_CHANGES.load(std::sync::atomic::Ordering::Relaxed), 1, "the frame's own failed edit is counted");
+        assert!(!relaunch_after_lost_frame(true, true, UNSAVED_CHANGES.load(std::sync::atomic::Ordering::Relaxed)));
+        // saved again: a restart is fine
+        disk.set_failing(false);
+        app.save().unwrap();
+        pass(&mut app);
+        assert_eq!(UNSAVED_CHANGES.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     /// Issue #374: launch arguments that would walk a whole drive or home folder are reported,

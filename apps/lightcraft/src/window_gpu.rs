@@ -427,6 +427,16 @@ mod tests {
         assert_eq!(rx.recv().unwrap(), expected, "dialog shown in {other:?}");
     }
 
+    /// Held by every test here that opens a wgpu instance, for its whole run. wgpu's GL backend
+    /// shares one EGL display between instances and terminates it when one is dropped, so a GL
+    /// instance opened and dropped by one test segfaults another drawing on Mesa GL meanwhile
+    /// (the FreeBSD CI runner, which has no Vulkan driver).
+    static GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn one_gpu_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        GPU_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("app-window-gpu-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -474,6 +484,7 @@ mod tests {
     /// wgpu's default panic. Needs an adapter; skipped where there is none (CI without a GPU).
     #[test]
     fn pipeline_errors_are_captured_not_panics() {
+        let _gpu = one_gpu_test_at_a_time();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: backend::window_backends(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -524,17 +535,18 @@ mod tests {
     #[test]
     fn a_lost_window_device_draws_empty_frames_without_a_panic() {
         use eframe::egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
+        let _gpu = one_gpu_test_at_a_time();
+        // Software adapters and wgpu's GL backend (Mesa GL on the FreeBSD CI runner, which has no
+        // Vulkan driver) segfault when a destroyed device is used, where Metal, DX12 and hardware
+        // Vulkan report the loss: nothing to learn there. GL isn't even opened (see `GPU_TESTS`).
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: backend::window_backends(),
+            backends: backend::window_backends() - Backends::GL,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
-            lightcraft_testkit::skip!(Gpu, "no GPU adapter");
+            lightcraft_testkit::skip!(Gpu, "no GPU adapter but GL's");
             return;
         };
-        // Software adapters and wgpu's GL backend (Mesa GL on the FreeBSD CI runner, which has no
-        // Vulkan driver) segfault when a destroyed device is used, where Metal, DX12 and hardware
-        // Vulkan report the loss: nothing to learn there.
         let info = adapter.get_info();
         if info.device_type == wgpu::DeviceType::Cpu || info.backend == wgpu::Backend::Gl {
             lightcraft_testkit::skip!(Gpu, "{} adapter {} crashes on a destroyed device", info.backend, info.name);
