@@ -153,12 +153,17 @@ fn solve(samples: &[Sample], n: usize) -> Option<Vec<f64>> {
     linalg::solve(ata, atb, dim).filter(|x| x.iter().all(|v| v.is_finite()))
 }
 
+/// The factor [`correct`] multiplies a pixel by at a tile's stored squared radius `r` (× 65535).
+pub(crate) fn factor(c: &[f64; 3], r: u16) -> f32 {
+    (-log_v(c, r as f64 / u16::MAX as f64)).exp() as f32
+}
+
 /// Divide every tile by the falloff `V(r)` with coefficients `c`.
 pub(crate) fn correct(tiles: &mut [Option<Tile>], c: &[f64; 3]) {
     for t in tiles.iter_mut().flatten() {
         let r2 = std::mem::take(&mut t.r2);
         t.rgb.par_iter_mut().zip(r2.par_iter()).for_each(|(p, &r)| {
-            let f = (-log_v(c, r as f64 / u16::MAX as f64)).exp() as f32;
+            let f = factor(c, r);
             *p = p.map(|v| v * f);
         });
         t.r2 = r2;

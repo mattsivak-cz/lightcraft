@@ -337,7 +337,7 @@ pub fn stitch(mut frames: Vec<Frame>, opts: &PanoOptions, progress: &Progress) -
     if let Some(c) = &vignette {
         vignette::correct(&mut tiles, c);
     }
-    let offsets = compensate_exposure(&tiles, &mut gains, &frames);
+    let offsets = compensate_exposure(&tiles, &mut gains, &frames, vignette.as_ref());
     // the tiles hold every pixel the blend needs: the frames' own go now, before the blend
     // takes its memory (12 bytes a pixel of every photo: 3 GB for five 51 MP frames)
     for f in &mut frames {
@@ -483,8 +483,9 @@ const EXPOSURE_BINS: usize = 8;
 /// facing the sun records the scene plus veiling flare, a pure gain lines up its midtones and leaves
 /// its shadows lifted, a visible step at the seams. Offsets are then made relative to the frame
 /// with the least (flare only ever adds light), so only the extra is taken out. Returns the offsets
-/// (in output units); on failure the EXIF gains stay and every offset is 0.
-fn compensate_exposure(tiles: &[Option<Tile>], gains: &mut [f64], frames: &[Frame]) -> Vec<f64> {
+/// (in output units); on failure the EXIF gains stay and every offset is 0. `vignette_c` is the correction the
+/// tiles already carry ([`vignette::correct`]), so clipping is tested on the values the frames recorded.
+fn compensate_exposure(tiles: &[Option<Tile>], gains: &mut [f64], frames: &[Frame], vignette_c: Option<&[f64; 3]>) -> Vec<f64> {
     let n = tiles.len();
     let none = vec![0f64; n];
     let lum = |p: [f32; 3]| 0.25 * p[0] as f64 + 0.6 * p[1] as f64 + 0.15 * p[2] as f64;
@@ -502,7 +503,15 @@ fn compensate_exposure(tiles: &[Option<Tile>], gains: &mut [f64], frames: &[Fram
                     let ka = (y - a.y0) * a.w + x - a.x0;
                     let kb = (y - b.y0) * b.w + x - b.x0;
                     let (Some(&wa), Some(&wb), Some(&pa), Some(&pb)) = (a.wgt.get(ka), b.wgt.get(kb), a.rgb.get(ka), b.rgb.get(kb)) else { continue };
-                    if wa > 0.0 && wb > 0.0 && pa.iter().all(|v| *v < frames[i].clip * 0.95) && pb.iter().all(|v| *v < frames[j].clip * 0.95) {
+                    // clipped is judged on the values the frame recorded: the vignetting correction scaled them by `f`
+                    let (fa, fb) = vignette_c.map_or((1.0, 1.0), |c| {
+                        (vignette::factor(c, a.r2.get(ka).copied().unwrap_or(0)), vignette::factor(c, b.r2.get(kb).copied().unwrap_or(0)))
+                    });
+                    if wa > 0.0
+                        && wb > 0.0
+                        && pa.iter().all(|v| *v < frames[i].clip * 0.95 * fa)
+                        && pb.iter().all(|v| *v < frames[j].clip * 0.95 * fb)
+                    {
                         v.push((lum(pa), lum(pb)));
                     }
                 }
@@ -587,13 +596,36 @@ mod exposure_tests {
         frame.clip = f32::INFINITY;
         let frames = vec![frame.clone(), frame];
         let mut gains = vec![1.0, 1.0];
-        let offsets = compensate_exposure(&[Some(a), Some(b)], &mut gains, &frames);
+        let offsets = compensate_exposure(&[Some(a), Some(b)], &mut gains, &frames, None);
         assert!(offsets[0].abs() < 1e-4 && (offsets[1] - 0.01 * gains[1]).abs() < 2e-3, "{offsets:?} {gains:?}");
         // where the flare is less than half the pixel (deeper in the shadows at most half is taken out, on purpose)
         for x in (100..200).filter(|&x| 0.01 < 0.5 * (1.2 * scene(x) + 0.01)) {
             let (pa, pb) = (scene(x) * gains[0] as f32, compensated([1.2 * scene(x) + 0.01; 3], gains[1] as f32, offsets[1] as f32, [1.0; 3])[0]);
             assert!((pa - pb).abs() < 0.1 * pa + 2e-3, "x {x}: {pa} {pb}");
         }
+    }
+
+    /// Frames whose edges the vignetting fit darkens (here by 0.8 everywhere, both frames at the same radius): the
+    /// first clipped its highlights, the second didn't. Corrected, the clipped pixels sit at 0.8 of the clip level,
+    /// under the test's 0.95: compared there they would pair a clipped frame with a bright one and pull the gains
+    /// apart. Clipping is judged on the values the frame recorded, so the gains stay equal.
+    #[test]
+    fn clipping_is_judged_before_the_vignetting_correction() {
+        let c = [1.25f64.ln(), 0.0, 0.0];
+        let scene = |x: usize| 0.05 + 1.2 * ((x as f32 * 0.05).sin() * 0.5 + 0.5);
+        let recorded = |clip: f32| move |x: usize| (1.25 * scene(x)).min(clip);
+        let (mut a, mut b) = (tile(0, recorded(1.0)), tile(100, recorded(f32::INFINITY)));
+        a.r2.fill(u16::MAX);
+        b.r2.fill(u16::MAX);
+        let mut tiles = [Some(a), Some(b)];
+        vignette::correct(&mut tiles, &c);
+        let mut frames = vec![Frame::from_linear_rec2020(Rgb32f::new(1, 1), None); 2];
+        frames[0].clip = 1.0;
+        frames[1].clip = f32::INFINITY;
+        let mut gains = vec![1.0, 1.0];
+        let offsets = compensate_exposure(&tiles, &mut gains, &frames, Some(&c));
+        assert!((gains[0] / gains[1] - 1.0).abs() < 0.01, "{gains:?} {offsets:?}");
+        assert!(offsets.iter().all(|o| o.abs() < 1e-3), "{gains:?} {offsets:?}");
     }
 
     /// An offset larger than a dark pixel never empties a channel (that left a pink line along a seam): it takes at
