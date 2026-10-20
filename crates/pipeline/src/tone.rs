@@ -296,22 +296,16 @@ pub fn whites_blacks_v3(o: f32, w: f32, b: f32) -> f32 {
     } else if w > 0.0 {
         let g = 1.0 / (1.0 - 0.23 * w.powf(1.6));
         let q = p * (1.0 + (g - 1.0) * smooth(0.0, 0.3, p));
-        // slope 1 at the knee, 0 where it reaches 1 (at knee + 2·(1 − knee)), clipped above
-        let knee = 0.9;
-        p = if q <= knee {
-            q
-        } else if q < knee + 2.0 * (1.0 - knee) {
-            q - (q - knee).powi(2) / (4.0 * (1.0 - knee))
-        } else {
-            1.0
-        };
+        // shoulder: slope 1 at 0.9, flat (and clipped) at 1 from q = 1.1
+        let q = q.min(1.1);
+        p = if q <= 0.9 { q } else { q - (q - 0.9).powi(2) / 0.4 };
     }
     if b < 0.0 {
         let a = -b;
         let bp = 0.13 * a + 0.08 * a * a * a;
         let e = 0.02;
         let soft = |v: f32| ((v - bp) + ((v - bp) * (v - bp) + e * e).sqrt()) * 0.5;
-        p = (soft(p) - soft(0.0)) / (soft(1.0) - soft(0.0)).max(1e-6);
+        p = (soft(p) - soft(0.0)) / (soft(1.0) - soft(0.0));
     } else if b > 0.0 {
         let lift = 0.17 * (1.0 - (-3.0 * b).exp()) / (1.0 - (-3.0f32).exp());
         p += lift * smooth(0.0, 0.08, p) * (1.0 - p).max(0.0).powf(1.25);

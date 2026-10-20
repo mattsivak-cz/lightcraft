@@ -7,7 +7,7 @@
 //! `cargo test -p lightcraft-pipeline light_probe -- --ignored --nocapture`.
 
 use lightcraft_develop::{DevelopSettings, Process, controls};
-use lightcraft_raster::Rgb32f;
+use lightcraft_raster::{Rgb32f, Rgba8};
 
 use crate::{RenderRequest, SourceInfo, render};
 
@@ -21,16 +21,11 @@ fn ev_of(i: usize) -> f32 {
 }
 
 fn curve() -> crate::tone::CameraTone {
-    #[derive(serde::Deserialize)]
-    struct File {
-        knots: [[f32; 2]; 32],
-    }
-    let f: File = serde_json::from_str(include_str!("../../../assets/camera-tone/sony-dro-off.json")).unwrap();
-    crate::tone::CameraTone::new(f.knots).unwrap()
+    serde_json::from_str(include_str!("../../../assets/camera-tone/sony-dro-off.json")).unwrap()
 }
 
 fn lstar(v: u8) -> f32 {
-    let y = lightcraft_color::transfer::srgb_to_linear(v as f32 / 255.0);
+    let y = lightcraft_color::transfer::decode_srgb8(v);
     if y > 216.0 / 24389.0 { 116.0 * y.cbrt() - 16.0 } else { y * 24389.0 / 27.0 }
 }
 
@@ -42,38 +37,39 @@ fn settings(process: Process, set: &[(&str, f64)]) -> DevelopSettings {
     s
 }
 
-fn shot(s: &DevelopSettings) -> Vec<u8> {
+fn shot(s: &DevelopSettings) -> Rgba8 {
     let (w, h) = (COLS * CELL, ROWS * CELL);
     let src = Rgb32f::from_fn(w, h, |x, y| [0.18 * ev_of((y / CELL) * COLS + x / CELL).exp2(); 3]);
     let info = SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve()), ..Default::default() };
-    render(&src, &info, s, &RenderRequest::fit(w, h)).image.data.iter().flatten().copied().collect()
+    render(&src, &info, s, &RenderRequest::fit(w, h)).image
 }
 
-/// L* at the centre of every patch.
+/// L* (of the green channel: the patches are grey) at the centre of every patch.
 fn patches(process: Process, set: &[(&str, f64)]) -> Vec<f32> {
     let img = shot(&settings(process, set));
-    (0..COLS * ROWS)
-        .map(|i| {
-            let (cx, cy) = ((i % COLS) * CELL + CELL / 2, (i / COLS) * CELL + CELL / 2);
-            lstar(img[(cy * COLS * CELL + cx) * 4 + 1])
-        })
-        .collect()
+    (0..COLS * ROWS).map(|i| lstar(img.get((i % COLS) * CELL + CELL / 2, (i / COLS) * CELL + CELL / 2)[1])).collect()
+}
+
+/// [`patches`] without edits: the same on every process (`v3_renders_like_v2_without_its_sliders`).
+fn neutral() -> &'static [f32] {
+    static NEUTRAL: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    NEUTRAL.get_or_init(|| patches(Process::V2, &[]))
 }
 
 /// Mean L* shift of `set` per 10-L* band of the neutral render (`None`: no patch in the band).
 fn bands(process: Process, set: &[(&str, f64)]) -> [Option<f32>; 10] {
-    let base = patches(process, &[]);
     let moved = patches(process, set);
+    let band_of = |l: f32| ((l / 10.0).floor() as usize).min(9);
     std::array::from_fn(|b| {
-        let d: Vec<f32> = base.iter().zip(&moved).filter(|(l, _)| ((**l / 10.0).floor() as usize).min(9) == b).map(|(l, m)| m - l).collect();
-        (!d.is_empty()).then(|| d.iter().sum::<f32>() / d.len() as f32)
+        let (sum, n) = neutral().iter().zip(&moved).filter(|(l, _)| band_of(**l) == b).fold((0.0, 0), |(s, n), (l, m)| (s + m - l, n + 1));
+        (n > 0).then(|| sum / n as f32)
     })
 }
 
 /// RMS over the bands of `got − want`.
 fn rms(got: &[Option<f32>; 10], want: &[f32; 10]) -> f32 {
-    let d: Vec<f32> = got.iter().zip(want).filter_map(|(g, w)| g.map(|g| (g - w).powi(2))).collect();
-    (d.iter().sum::<f32>() / d.len() as f32).sqrt()
+    let (sum, n) = got.iter().zip(want).filter_map(|(g, w)| g.map(|g| (g - w).powi(2))).fold((0.0, 0), |(s, n), d| (s + d, n + 1));
+    (sum / n as f32).sqrt()
 }
 
 const HIGHLIGHTS_M100: [f32; 10] = [-0.2, -0.9, -1.5, -2.1, -3.5, -5.9, -8.9, -14.0, -19.3, -15.6];
@@ -147,19 +143,19 @@ fn light_probe() {
     println!("{:<22} {}", "band L*", (0..10).map(|b| format!("{:>3}-{:<2}", b * 10, b * 10 + 10)).collect::<Vec<_>>().join(" "));
     for p in [Process::V2, Process::V3] {
         println!("-- {p:?}");
-        for (name, id, v) in [
-            ("Highlights -100", "light.highlights", -100.0),
-            ("Highlights +100", "light.highlights", 100.0),
-            ("Shadows +100", "light.shadows", 100.0),
-            ("Shadows -100", "light.shadows", -100.0),
-            ("Whites -100", "light.whites", -100.0),
-            ("Whites +100", "light.whites", 100.0),
-            ("Whites +50", "light.whites", 50.0),
-            ("Blacks -100", "light.blacks", -100.0),
-            ("Blacks +100", "light.blacks", 100.0),
+        for (id, v) in [
+            ("light.highlights", -100.0),
+            ("light.highlights", 100.0),
+            ("light.shadows", 100.0),
+            ("light.shadows", -100.0),
+            ("light.whites", -100.0),
+            ("light.whites", 100.0),
+            ("light.whites", 50.0),
+            ("light.blacks", -100.0),
+            ("light.blacks", 100.0),
         ] {
             let cells: Vec<String> = bands(p, &[(id, v)]).iter().map(|v| v.map_or("   -  ".into(), |v| format!("{v:+6.1}"))).collect();
-            println!("{name:<22} {}", cells.join(" "));
+            println!("{:<22} {}", format!("{id} {v:+}"), cells.join(" "));
         }
     }
 }
