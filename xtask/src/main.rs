@@ -448,6 +448,11 @@ fn cmd_ci(args: &[&str]) -> Result<(), String> {
     let command = std::iter::once("cargo xtask ci").chain(args.iter().copied()).collect::<Vec<_>>().join(" ");
     // held until ci returns: one run at a time per machine (ci_lock.rs)
     let _slot = ci_lock::acquire(&root, &command)?;
+    // a warmed target whose seed has moved: said at the start and again after the summary
+    let seed_drift = warm::seed_drift(&root);
+    if let Some(w) = &seed_drift {
+        eprintln!("{w}");
+    }
     let plan = if quick {
         let (base, files) = ci_quick::changed_files(&root, base)?;
         let plan = ci_quick::plan(&files, &ci_quick::packages(&root, &metadata()?), base);
@@ -649,6 +654,9 @@ fn cmd_ci(args: &[&str]) -> Result<(), String> {
     }
     if print_md {
         println!("\n{md}");
+    }
+    if let Some(w) = &seed_drift {
+        eprintln!("\n{w}");
     }
     match failure {
         Some((name, _)) => Err(format!("ci failed at `{name}`")),

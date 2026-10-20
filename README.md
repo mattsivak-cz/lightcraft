@@ -420,8 +420,10 @@ turn. `LIGHTCRAFT_CI_SLOTS=2` allows two; `LIGHTCRAFT_CI_LOCK=off` skips the loc
 main checkout's (macOS APFS, Linux reflinks: seconds, no extra disk), so the first build recompiles
 only the packages that differ from it, not all of LightCraft (sccache can't share the workspace's
 own crates between checkouts). Keep the main checkout on a clean `main` and fill it with
-`cargo xtask warm --seed` (ci's clippy and test builds). Reused crates read files through the
-seed's `CARGO_MANIFEST_DIR`; details in `xtask/src/warm.rs`.
+`cargo xtask warm --seed` (ci's clippy and test builds). The clone waits for and holds the CI lock, so
+it never copies a `ci` or `warm --seed` build in progress. Reused crates read files through the seed's
+`CARGO_MANIFEST_DIR`, so `warm` records the seed's commit and `cargo xtask ci` warns when the seed
+has moved since (re-warm with `cargo xtask warm --force`); details in `xtask/src/warm.rs`.
 
 CI defaults to line-table debug information and one build job per 1.5 GB of RAM
 available when it starts (at most one per CPU; 4 if memory can't be read), so an
