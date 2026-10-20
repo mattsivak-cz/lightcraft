@@ -15,14 +15,25 @@
 //!    too) with the current time, so that package and its dependents rebuild (an earlier warm may
 //!    have given them old times).
 //!
+//! The clone holds the CI lock (`ci_lock`, as `--seed` and `ci` do), so a `ci` or `warm --seed` run in
+//! the seed can't be writing artifacts while they are copied (it waits for a running one first;
+//! a plain `cargo build` there takes no lock).
+//!
 //! Reused crates keep the seed's `CARGO_MANIFEST_DIR` (`env!` uses, debuginfo paths): a reused
 //! test reads its fixtures from the seed checkout, whose files equal this one's at warm time.
-//! Keep the seed on a clean main and refresh it with `cargo xtask warm --seed`.
+//! So `warm` records the seed's state (its `HEAD` and a hash of its uncommitted changes to
+//! tracked files) in `target/.lightcraft-warm-seed`, and `cargo xtask ci` warns when the seed
+//! has moved since: reused tests may then read fixtures newer or older than this worktree's.
+//! `cargo xtask warm --force` re-warms. Keep the seed on a clean main and refresh it with
+//! `cargo xtask warm --seed`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
+
+/// The file in a warmed target directory that records the seed's state at warm time.
+const RECORD: &str = ".lightcraft-warm-seed";
 
 const USAGE: &str = "usage: cargo xtask warm [--from SEED_CHECKOUT] [--force] | cargo xtask warm --seed";
 
@@ -50,17 +61,15 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
     if !has_workspace_builds(&seed_target) {
         return Err(format!("warm: {} has no workspace builds; run `cargo xtask warm --seed` in {}", seed_target.display(), seed.display()));
     }
-    let dest = match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(d) if Path::new(&d).is_absolute() => PathBuf::from(d),
-        Some(d) => root.join(d),
-        None => root.join("target"),
-    };
+    let dest = target_dir(root);
     if has_workspace_builds(&dest) && !force {
         return Err(format!("warm: {} already has workspace builds; --force replaces them", dest.display()));
     }
 
     // Everything that can fail runs before the clone replaces `dest`, so a failure keeps the old one.
     let t = Instant::now();
+    // the state the comparison below sees, recorded once the clone is in place
+    let seed_state = SeedState::read(&seed)?;
     let packages = crate::ci_quick::packages(root, &crate::metadata()?);
     let ours = listed_files(root)?;
     let theirs = listed_files(&seed)?;
@@ -74,7 +83,11 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
     let compared = t.elapsed();
 
     let t = Instant::now();
-    clone_dir(&seed_target, &dest)?;
+    {
+        // a ci run in the seed (or anywhere) writes artifacts; don't copy them half-written
+        let _slot = crate::ci_lock::acquire(root, &format!("cargo xtask warm (cloning {})", seed_target.display()))?;
+        clone_dir(&seed_target, &dest)?;
+    }
     eprintln!("cloned {} → {} in {:.1} s", seed_target.display(), dest.display(), t.elapsed().as_secs_f64());
 
     let t = Instant::now();
@@ -96,12 +109,104 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
         differ.len(),
         (compared + t.elapsed()).as_secs_f64()
     );
+    let record = dest.join(RECORD);
+    if let Err(e) = std::fs::write(&record, seed_state.record(&seed)) {
+        eprintln!("warning: {}: {e}; `cargo xtask ci` can't tell when the seed moves", record.display());
+    }
     if rebuilt.is_empty() {
         eprintln!("no package differs from the seed: builds the seed has done are fresh here");
     } else {
         eprintln!("differ from the seed, rebuilt with their dependents on the next build: {}", rebuilt.into_iter().collect::<Vec<_>>().join(", "));
     }
     Ok(())
+}
+
+/// The target directory cargo builds into from `root` (`CARGO_TARGET_DIR`, else `target/`).
+fn target_dir(root: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(d) if Path::new(&d).is_absolute() => PathBuf::from(d),
+        Some(d) => root.join(d),
+        None => root.join("target"),
+    }
+}
+
+/// A seed checkout's state: what its reused test binaries read fixtures from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SeedState {
+    head: String,
+    /// FNV-1a hash of `git diff HEAD` (uncommitted changes to tracked files); `None` when clean.
+    changes: Option<u64>,
+}
+
+impl SeedState {
+    fn read(seed: &Path) -> Result<Self, String> {
+        let git = |args: &[&str]| -> Result<Vec<u8>, String> {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(seed)
+                .output()
+                .map_err(|e| format!("git {} in {}: {e}", args.join(" "), seed.display()))?;
+            if !out.status.success() {
+                return Err(format!("git {} in {}: {}", args.join(" "), seed.display(), String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            Ok(out.stdout)
+        };
+        let head = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"])?).trim().to_owned();
+        let diff = git(&["diff", "HEAD", "--no-ext-diff", "--no-textconv", "--no-color", "--binary"])?;
+        Ok(SeedState { head, changes: (!diff.is_empty()).then(|| fnv1a(&diff)) })
+    }
+
+    fn describe(&self) -> String {
+        let short: String = self.head.chars().take(10).collect();
+        if self.changes.is_some() { format!("{short} with uncommitted changes") } else { format!("{short}, clean") }
+    }
+
+    /// The record file's text: `key<TAB>value` lines.
+    fn record(&self, seed: &Path) -> String {
+        let changes = self.changes.map_or_else(|| "clean".to_owned(), |h| format!("{h:016x}"));
+        format!("seed\t{}\nhead\t{}\nchanges\t{changes}\n", seed.display(), self.head)
+    }
+
+    /// Parse [`SeedState::record`]'s text: the seed checkout and its state, `None` if malformed.
+    fn parse(text: &str) -> Option<(PathBuf, SeedState)> {
+        let field = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('\t'));
+        let seed = PathBuf::from(field("seed")?);
+        let head = field("head")?.to_owned();
+        let changes = match field("changes")? {
+            "clean" => None,
+            h => Some(u64::from_str_radix(h, 16).ok()?),
+        };
+        (!head.is_empty()).then_some((seed, SeedState { head, changes }))
+    }
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// The warning for a target warmed from `seed` in state `then`, now in `now` (`Err`: unreadable).
+fn drift_warning(seed: &Path, then: &SeedState, now: Result<SeedState, String>) -> Option<String> {
+    let now = match now {
+        Ok(now) if now == *then => return None,
+        Ok(now) => now.describe(),
+        Err(e) => format!("unknown ({e})"),
+    };
+    Some(format!(
+        "warning: this target/ was warmed from {} at {}; the seed is now at {now}.\n  \
+         Test binaries reused from the warm read their fixtures from the seed checkout, so they may see \
+         files that differ from this worktree's.\n  Run `cargo xtask warm --force` to re-warm (after \
+         `cargo xtask warm --seed` in the seed, if its builds are stale).",
+        seed.display(),
+        then.describe()
+    ))
+}
+
+/// For `cargo xtask ci`: a warning when this checkout's target directory was warmed and the seed
+/// has moved since (see the module docs). Never fails.
+pub fn seed_drift(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(target_dir(root).join(RECORD)).ok()?;
+    let (seed, then) = SeedState::parse(&text)?;
+    drift_warning(&seed, &then, SeedState::read(&seed))
 }
 
 /// `--seed`: the builds `cargo xtask ci` does first (clippy, the workspace tests), with its
@@ -237,6 +342,69 @@ fn set_mtime(path: &Path, time: std::time::SystemTime) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_record_round_trips() {
+        let seed = Path::new("/work/lightcraft");
+        for state in [SeedState { head: "abc123".into(), changes: None }, SeedState { head: "def456".into(), changes: Some(0x0123_4567_89ab_cdef) }] {
+            assert_eq!(SeedState::parse(&state.record(seed)), Some((seed.to_path_buf(), state)));
+        }
+        for bad in ["", "seed\t/x\nhead\t\nchanges\tclean\n", "seed\t/x\nhead\tabc\n", "seed\t/x\nhead\tabc\nchanges\tzz\n", "\0\u{fffd}"] {
+            assert_eq!(SeedState::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn drift_warns_only_when_the_seed_moved() {
+        let seed = Path::new("/work/lightcraft");
+        let then = SeedState { head: "aaaa".into(), changes: None };
+        assert_eq!(drift_warning(seed, &then, Ok(then.clone())), None);
+        let moved = drift_warning(seed, &then, Ok(SeedState { head: "bbbb".into(), changes: None })).expect("moved");
+        assert!(moved.contains("aaaa, clean") && moved.contains("bbbb, clean") && moved.contains("warm --force"), "{moved}");
+        let edited = drift_warning(seed, &then, Ok(SeedState { head: "aaaa".into(), changes: Some(1) })).expect("edited");
+        assert!(edited.contains("uncommitted changes"), "{edited}");
+        let gone = drift_warning(seed, &then, Err("no such directory".into())).expect("unreadable");
+        assert!(gone.contains("no such directory"), "{gone}");
+    }
+
+    #[test]
+    fn seed_state_follows_commits_and_edits() {
+        let dir = std::env::temp_dir().join(format!("xtask-warm-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+        };
+        if !git(&["init", "-q"]).is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped seed_state_follows_commits_and_edits: no git");
+            return;
+        }
+        std::fs::write(dir.join("fixture.txt"), "one").unwrap();
+        git(&["add", "."]).unwrap();
+        git(&["commit", "-q", "-m", "one"]).unwrap();
+        let clean = SeedState::read(&dir).unwrap();
+        assert_eq!(clean.changes, None);
+        assert_eq!(SeedState::read(&dir).unwrap(), clean);
+        std::fs::write(dir.join("fixture.txt"), "two").unwrap();
+        let edited = SeedState::read(&dir).unwrap();
+        assert!(edited.head == clean.head && edited.changes.is_some());
+        std::fs::write(dir.join("fixture.txt"), "three").unwrap();
+        assert_ne!(SeedState::read(&dir).unwrap(), edited, "a further edit of a dirty file");
+        git(&["commit", "-q", "-am", "three"]).unwrap();
+        let committed = SeedState::read(&dir).unwrap();
+        assert!(committed.head != clean.head && committed.changes.is_none());
+        // the record a warm writes, read back and compared with the seed as it is now
+        let (seed, then) = SeedState::parse(&committed.record(&dir)).unwrap();
+        assert_eq!(drift_warning(&seed, &then, SeedState::read(&seed)), None);
+        std::fs::write(dir.join("fixture.txt"), "four").unwrap();
+        assert!(drift_warning(&seed, &then, SeedState::read(&seed)).is_some());
+        assert!(SeedState::read(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn workspace_builds_are_told_from_xtask_only() {
