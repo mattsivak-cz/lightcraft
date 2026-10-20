@@ -59,10 +59,7 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
         return Err(format!("warm: {} already has workspace builds; --force replaces them", dest.display()));
     }
 
-    let t = Instant::now();
-    clone_dir(&seed_target, &dest)?;
-    eprintln!("cloned {} → {} in {:.1} s", seed_target.display(), dest.display(), t.elapsed().as_secs_f64());
-
+    // Everything that can fail runs before the clone replaces `dest`, so a failure keeps the old one.
     let t = Instant::now();
     let packages = crate::ci_quick::packages(root, &crate::metadata()?);
     let ours = listed_files(root)?;
@@ -74,16 +71,31 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
         }
     }
     let rebuilt: BTreeSet<&str> = differ.iter().filter_map(|p| crate::ci_quick::owner(p, &packages)).collect();
-    let now = std::time::SystemTime::now();
-    let mut synced = 0usize;
-    for path in &ours {
-        let dirty = differ.contains(path.as_str()) || crate::ci_quick::owner(path, &packages).is_some_and(|o| rebuilt.contains(o));
-        let set = if dirty { set_mtime(&root.join(path), now) } else { copy_mtime(&seed.join(path), &root.join(path)) };
-        if set.is_ok() && !dirty {
-            synced += 1;
-        }
+    let compared = t.elapsed();
+
+    let t = Instant::now();
+    clone_dir(&seed_target, &dest)?;
+    eprintln!("cloned {} → {} in {:.1} s", seed_target.display(), dest.display(), t.elapsed().as_secs_f64());
+
+    let t = Instant::now();
+    let dirty = |path: &str| differ.contains(path) || crate::ci_quick::owner(path, &packages).is_some_and(|o| rebuilt.contains(o));
+    let stamps = stamp_times(root, &seed, &ours, dirty);
+    if let Some((n, first)) = &stamps.unsynced {
+        // left with its checkout time, newer than the seed's outputs: its package only rebuilds
+        eprintln!("warning: {n} unchanged files keep their own timestamps (first: {first}); their packages may rebuild");
     }
-    eprintln!("{synced} unchanged files take the seed's timestamps ({} differ; {:.1} s)", differ.len(), t.elapsed().as_secs_f64());
+    if let Some((n, first)) = &stamps.unstamped {
+        return Err(format!(
+            "warm: could not give {n} changed files the current time (first: {first}); an older time could make a stale \
+             build look fresh. Fix that and run `cargo xtask warm --force` again"
+        ));
+    }
+    eprintln!(
+        "{} unchanged files take the seed's timestamps ({} differ; {:.1} s)",
+        stamps.synced,
+        differ.len(),
+        (compared + t.elapsed()).as_secs_f64()
+    );
     if rebuilt.is_empty() {
         eprintln!("no package differs from the seed: builds the seed has done are fresh here");
     } else {
@@ -135,8 +147,10 @@ fn clone_dir(from: &Path, to: &Path) -> Result<(), String> {
         c.arg("-c");
         c
     } else if cfg!(target_os = "linux") {
+        // GNU cp, unlike macOS `cp -c`, gives copies the current time unless asked: a seed whose
+        // sources are newer than its outputs would then look fresh in the clone
         let mut c = Command::new("cp");
-        c.arg("--reflink=always");
+        c.args(["--reflink=always", "--preserve=timestamps"]);
         c
     } else {
         return Err("warm: needs copy-on-write clones (macOS APFS, or reflinks on Linux btrfs / XFS)".into());
@@ -178,6 +192,40 @@ fn same_bytes(a: &Path, b: &Path) -> bool {
     ma.len() == mb.len() && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
+/// What [`stamp_times`] did: how many files took the seed's time, and the files it couldn't
+/// stamp (count, first path) among the unchanged and the dirty ones.
+#[derive(Debug, Default)]
+struct Stamps {
+    synced: usize,
+    unsynced: Option<(usize, String)>,
+    unstamped: Option<(usize, String)>,
+}
+
+/// Give each of `files` (relative to `root`) the current time if it is `dirty`, else the time of
+/// the same file in `seed`.
+fn stamp_times(root: &Path, seed: &Path, files: &BTreeSet<String>, dirty: impl Fn(&str) -> bool) -> Stamps {
+    fn note(slot: &mut Option<(usize, String)>, path: &str) {
+        match slot {
+            Some((n, _)) => *n += 1,
+            None => *slot = Some((1, path.to_owned())),
+        }
+    }
+    let now = std::time::SystemTime::now();
+    let mut stamps = Stamps::default();
+    for path in files {
+        if dirty(path) {
+            if set_mtime(&root.join(path), now).is_err() {
+                note(&mut stamps.unstamped, path);
+            }
+        } else if copy_mtime(&seed.join(path), &root.join(path)).is_ok() {
+            stamps.synced += 1;
+        } else {
+            note(&mut stamps.unsynced, path);
+        }
+    }
+    stamps
+}
+
 fn copy_mtime(from: &Path, to: &Path) -> std::io::Result<()> {
     set_mtime(to, std::fs::metadata(from)?.modified()?)
 }
@@ -215,6 +263,51 @@ mod tests {
         std::fs::File::options().write(true).open(&a).unwrap().set_modified(old).unwrap();
         copy_mtime(&a, &b).unwrap();
         assert_eq!(std::fs::metadata(&b).unwrap().modified().unwrap(), old);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_failures_are_counted() {
+        let dir = std::env::temp_dir().join(format!("xtask-warm-stamps-{}", std::process::id()));
+        let (root, seed) = (dir.join("root"), dir.join("seed"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&seed).unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+        for name in ["dirty", "kept"] {
+            std::fs::write(root.join(name), name).unwrap();
+            std::fs::write(seed.join(name), name).unwrap();
+            std::fs::File::options().write(true).open(seed.join(name)).unwrap().set_modified(old).unwrap();
+            std::fs::File::options().write(true).open(root.join(name)).unwrap().set_modified(old).unwrap();
+        }
+        std::fs::write(root.join("no-seed"), "x").unwrap();
+        let files: BTreeSet<String> = ["dirty", "gone", "gone-too", "kept", "no-seed"].map(str::to_owned).into();
+        let stamps = stamp_times(&root, &seed, &files, |p| p == "dirty" || p.starts_with("gone"));
+        assert_eq!(stamps.synced, 1);
+        assert_eq!(std::fs::metadata(root.join("kept")).unwrap().modified().unwrap(), old);
+        assert!(std::fs::metadata(root.join("dirty")).unwrap().modified().unwrap() > old);
+        assert_eq!(stamps.unsynced, Some((1, "no-seed".to_owned())));
+        assert_eq!(stamps.unstamped, Some((2, "gone".to_owned())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clone_keeps_file_times_and_replaces_the_target() {
+        let dir = std::env::temp_dir().join(format!("xtask-warm-clone-{}", std::process::id()));
+        let (from, to) = (dir.join("from"), dir.join("to"));
+        std::fs::create_dir_all(from.join("sub")).unwrap();
+        std::fs::write(from.join("sub").join("f"), "x").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+        std::fs::File::options().write(true).open(from.join("sub").join("f")).unwrap().set_modified(old).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(to.join("stale"), "y").unwrap();
+        if let Err(e) = clone_dir(&from, &to) {
+            // no copy-on-write file system under the temp dir (tmpfs, ext4)
+            eprintln!("skipped clone_keeps_file_times_and_replaces_the_target: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(std::fs::metadata(to.join("sub").join("f")).unwrap().modified().unwrap(), old);
+        assert!(!to.join("stale").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
