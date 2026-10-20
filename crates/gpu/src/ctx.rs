@@ -268,23 +268,19 @@ fn constants() -> String {
     s
 }
 
-/// Every parameter field a kernel reads (`F_NAME`) is in the block (`params::FIELDS`): a missing one
-/// fails the kernel's compile, which only a machine with a GPU would notice.
+/// Every kernel, with the constants and bindings it is built with, parses and validates: one that
+/// doesn't compile (e.g. reading a parameter field missing from `params::FIELDS`) would otherwise
+/// only show on a machine with a GPU.
 #[cfg(test)]
 #[test]
-fn kernels_read_only_declared_fields() {
+fn kernels_compile() {
     let consts = constants();
     for m in MODULES {
-        let mut rest = m.src;
-        while let Some(at) = rest.find("F_") {
-            let tail = &rest[at..];
-            let len = tail.find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')).unwrap_or(tail.len());
-            let name = &tail[..len];
-            let word_start = rest[..at].chars().next_back().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
-            if word_start && len > 2 {
-                assert!(consts.contains(&format!("const {name}: u32")), "{name} is read by a kernel but not declared");
-            }
-            rest = &tail[len.max(2)..];
+        let src = module_source(m, &consts);
+        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+        let mut validator = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all());
+        if let Err(e) = validator.validate(&module) {
+            panic!("{}", e.emit_to_string(&src));
         }
     }
 }
