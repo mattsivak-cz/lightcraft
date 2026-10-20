@@ -15,9 +15,10 @@
 //!    too) with the current time, so that package and its dependents rebuild (an earlier warm may
 //!    have given them old times).
 //!
-//! The clone holds the CI lock (`ci_lock`, as `--seed` and `ci` do), so a `ci` or `warm --seed` run in
-//! the seed can't be writing artifacts while they are copied (it waits for a running one first;
-//! a plain `cargo build` there takes no lock).
+//! The whole warm holds the CI lock (`ci_lock`, as `--seed` and `ci` do), so a `ci` or
+//! `warm --seed` run in the seed can't be writing artifacts while they are copied, and a `ci` in
+//! this worktree can't start building on the clone before step 3 has stamped the changed files
+//! (it waits for a running one first; a plain `cargo build` in either takes no lock).
 //!
 //! Reused crates keep the seed's `CARGO_MANIFEST_DIR` (`env!` uses, debuginfo paths): a reused
 //! test reads its fixtures from the seed checkout, whose files equal this one's at warm time.
@@ -49,10 +50,12 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
     if seed_mode {
         return build_seed(root);
     }
-    let seed = match from {
+    // absolute: the record below is read back by `cargo xtask ci` from any directory, so a
+    // relative `--from` would resolve against the wrong one
+    let seed = absolute(&match from {
         Some(f) => PathBuf::from(f),
         None => main_worktree(root)?,
-    };
+    })?;
     let same = |a: &Path, b: &Path| a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(a, b)| a == b);
     if same(&seed, root) {
         return Err(format!("warm: {} is the seed checkout itself; refresh its builds with `cargo xtask warm --seed`", root.display()));
@@ -68,6 +71,10 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
 
     // Everything that can fail runs before the clone replaces `dest`, so a failure keeps the old one.
     let t = Instant::now();
+    // Held for the rest of the warm: a `ci` run in the seed (or anywhere) writes artifacts, so
+    // they mustn't be copied half-written, and a `ci` in this worktree mustn't start building on
+    // the clone before `stamp_times` has given the changed files the current time.
+    let _slot = crate::ci_lock::acquire(root, &format!("cargo xtask warm (from {})", seed.display()))?;
     // the state the comparison below sees, recorded once the clone is in place
     let seed_state = SeedState::read(&seed)?;
     let packages = crate::ci_quick::packages(root, &crate::metadata()?);
@@ -83,11 +90,7 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
     let compared = t.elapsed();
 
     let t = Instant::now();
-    {
-        // a ci run in the seed (or anywhere) writes artifacts; don't copy them half-written
-        let _slot = crate::ci_lock::acquire(root, &format!("cargo xtask warm (cloning {})", seed_target.display()))?;
-        clone_dir(&seed_target, &dest)?;
-    }
+    clone_dir(&seed_target, &dest)?;
     eprintln!("cloned {} → {} in {:.1} s", seed_target.display(), dest.display(), t.elapsed().as_secs_f64());
 
     let t = Instant::now();
@@ -128,6 +131,12 @@ fn target_dir(root: &Path) -> PathBuf {
         Some(d) => root.join(d),
         None => root.join("target"),
     }
+}
+
+/// `path` resolved to an absolute path (symlinks and `..` too), so it still names the same
+/// directory when `cargo xtask ci` reads it back from another working directory.
+fn absolute(path: &Path) -> Result<PathBuf, String> {
+    path.canonicalize().map_err(|e| format!("warm: {}: {e}", path.display()))
 }
 
 /// A seed checkout's state: what its reused test binaries read fixtures from.
@@ -352,6 +361,18 @@ mod tests {
         for bad in ["", "seed\t/x\nhead\t\nchanges\tclean\n", "seed\t/x\nhead\tabc\n", "seed\t/x\nhead\tabc\nchanges\tzz\n", "\0\u{fffd}"] {
             assert_eq!(SeedState::parse(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_recorded_seed_path_is_absolute() {
+        // a relative `--from` left as it is would be resolved from wherever `cargo xtask ci` runs
+        let here = absolute(Path::new(".")).unwrap();
+        assert!(here.is_absolute(), "{}", here.display());
+        let src = absolute(Path::new("src")).unwrap(); // relative to this package's directory
+        assert!(src.is_absolute() && src.ends_with("src"), "{}", src.display());
+        let record = SeedState { head: "aaaa".into(), changes: None }.record(&src);
+        assert_eq!(SeedState::parse(&record).unwrap().0, src);
+        assert!(absolute(&here.join("does-not-exist")).is_err());
     }
 
     #[test]
