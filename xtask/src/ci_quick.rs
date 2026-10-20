@@ -12,6 +12,8 @@
 //!   deletions: the tracker cites paths);
 //! - the wasm check of the changed packages that must build for wasm32.
 //!
+//! A file outside any package that a crate compiles in (`include_str!` of `docs/whats-new.md`,
+//! fonts and camera profiles under `assets/`, ...) counts as a change to that crate (`EMBEDDED`).
 //! A change to a workspace-wide file (root `Cargo.toml`, `Cargo.lock`, lint or toolchain config)
 //! tests everything. The full `ci` (GitHub's CI on every PR) stays the merge gate.
 
@@ -27,6 +29,26 @@ const WORKSPACE_WIDE_DIRS: &[&str] = &[".cargo/"];
 const PARITY_PACKAGES: &[&str] = &["lightcraft-engine", "lightcraft-develop", "lightcraft-ui-egui", "lightcraft-cli"];
 const PARITY_DOCS: &[&str] = &["docs/parity-checklist.md", "docs/gaps.md"];
 const HEIF_PACKAGES: &[&str] = &["lightcraft-codecs", "lightcraft-heif"];
+/// Files outside a package's directory that it compiles in (`include_str!` / `include_bytes!`,
+/// a build script's `rerun-if-changed`): a change to one counts as a change to those packages.
+/// An entry ending in `/` covers the directory. `embedded_files_are_mapped` keeps this complete.
+const EMBEDDED: &[(&str, &[&str])] = &[
+    ("assets/app-icon/", &["lightcraft"]),
+    ("assets/camera-profiles/", &["lightcraft-engine"]),
+    ("assets/camera-tone/", &["lightcraft-engine"]),
+    ("assets/fonts/", &["lightcraft-engine", "lightcraft-ui-egui"]),
+    ("contributors/", &["lightcraft-ui-egui"]),
+    ("docs/whats-new.md", &["lightcraft-ui-egui"]),
+    ("docs/raw/coverage-sweep.tsv", &["lightcraft-raw"]),
+    ("docs/raf-corpus.sha256", &["lightcraft-raw"]),
+    ("xtask/src/main.rs", &["lightcraft-raw"]),
+    ("crates/ui-egui/src/menus.rs", &["xtask"]),
+];
+
+/// The packages that compile in `path` from outside their own directory.
+fn embedders(path: &str) -> impl Iterator<Item = &'static str> + '_ {
+    EMBEDDED.iter().filter(move |(p, _)| if p.ends_with('/') { path.starts_with(p) } else { path == *p }).flat_map(|(_, pkgs)| pkgs.iter().copied())
+}
 
 /// A changed path, relative to the workspace root; `gone` when deleted or renamed away.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +91,11 @@ pub fn plan(changed: &[Changed], packages: &[(String, String)], base: String) ->
         if let Some(name) = owner(path, packages) {
             p.packages.insert(name.to_owned());
         }
+        for name in embedders(path) {
+            if packages.iter().any(|(n, _)| n == name) {
+                p.packages.insert(name.to_owned());
+            }
+        }
     }
     p.heif = p.workspace_wide || HEIF_PACKAGES.iter().any(|h| p.packages.contains(*h));
     p.parity |= p.workspace_wide || PARITY_PACKAGES.iter().any(|h| p.packages.contains(*h));
@@ -92,23 +119,32 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Parse `git diff --name-status` output.
+/// Parse `git diff --name-status -z` output: NUL-separated fields, a status then its path, or
+/// two paths (old, new) for a rename or copy. `-z` leaves non-ASCII paths unquoted.
 fn parse_name_status(out: &str) -> Vec<Changed> {
     let mut v = Vec::new();
-    for line in out.lines() {
-        let mut cols = line.split('\t');
-        let (Some(status), Some(first)) = (cols.next(), cols.next()) else { continue };
-        match (status.chars().next(), cols.next()) {
+    let mut fields = out.split('\0');
+    while let Some(status) = fields.next() {
+        let Some(kind) = status.trim().chars().next() else { continue };
+        let Some(first) = fields.next() else { break };
+        match kind {
             // renamed / copied: old path, new path
-            (Some(k @ ('R' | 'C')), Some(second)) => {
-                v.push(Changed { path: first.to_owned(), gone: k == 'R' });
-                v.push(Changed { path: second.to_owned(), gone: false });
+            'R' | 'C' => {
+                v.push(Changed { path: first.to_owned(), gone: kind == 'R' });
+                if let Some(second) = fields.next() {
+                    v.push(Changed { path: second.to_owned(), gone: false });
+                }
             }
-            (Some('D'), _) => v.push(Changed { path: first.to_owned(), gone: true }),
+            'D' => v.push(Changed { path: first.to_owned(), gone: true }),
             _ => v.push(Changed { path: first.to_owned(), gone: false }),
         }
     }
     v
+}
+
+/// Parse NUL-separated `git ls-files -z` output.
+fn parse_paths_z(out: &str) -> impl Iterator<Item = Changed> + '_ {
+    out.split('\0').filter(|p| !p.is_empty()).map(|p| Changed { path: p.to_owned(), gone: false })
 }
 
 /// The files changed since the merge base with `base` (default `origin/main`, else `main`):
@@ -123,10 +159,8 @@ pub fn changed_files(root: &Path, base: Option<&str>) -> Result<(String, Vec<Cha
             .to_owned(),
     };
     let merge_base = git(root, &["merge-base", "HEAD", &base])?.trim().to_owned();
-    let mut files = parse_name_status(&git(root, &["diff", "--name-status", "-M", &merge_base])?);
-    for path in git(root, &["ls-files", "--others", "--exclude-standard"])?.lines() {
-        files.push(Changed { path: path.to_owned(), gone: false });
-    }
+    let mut files = parse_name_status(&git(root, &["diff", "--name-status", "-z", "-M", &merge_base])?);
+    files.extend(parse_paths_z(&git(root, &["ls-files", "-z", "--others", "--exclude-standard"])?));
     let short: String = merge_base.chars().take(10).collect();
     Ok((format!("{base} (merge base {short})"), files))
 }
@@ -199,10 +233,121 @@ mod tests {
 
     #[test]
     fn name_status_parses_renames_and_deletions() {
-        let v = parse_name_status("M\ta.rs\nR087\told.rs\tnew.rs\nD\tgone.rs\nA\tadded.rs\n\n");
+        let v = parse_name_status("M\0a.rs\0R087\0old.rs\0new.rs\0D\0gone.rs\0C100\0src.rs\0copy.rs\0A\0added.rs\0");
         assert_eq!(
             v,
-            [ch("a.rs"), Changed { path: "old.rs".into(), gone: true }, ch("new.rs"), Changed { path: "gone.rs".into(), gone: true }, ch("added.rs"),]
+            [
+                ch("a.rs"),
+                Changed { path: "old.rs".into(), gone: true },
+                ch("new.rs"),
+                Changed { path: "gone.rs".into(), gone: true },
+                ch("src.rs"),
+                ch("copy.rs"),
+                ch("added.rs"),
+            ]
         );
+        // truncated output: no panic, keeps what it could read
+        assert_eq!(parse_name_status("M\0a.rs\0R100\0x.rs"), [ch("a.rs"), Changed { path: "x.rs".into(), gone: true }]);
+    }
+
+    #[test]
+    fn non_ascii_paths_still_map_to_their_package() {
+        // without -z, git prints these quoted and octal-escaped ("crates/raw/src/\303\251t\303\251.rs")
+        let v = parse_name_status("M\0crates/raw/src/été.rs\0R100\0crates/engine/a.rs\0crates/engine/日本.rs\0");
+        assert_eq!(v[0], ch("crates/raw/src/été.rs"));
+        assert_eq!(v[2], ch("crates/engine/日本.rs"));
+        let untracked: Vec<_> = parse_paths_z("crates/codecs/ünï code.rs\0").collect();
+        assert_eq!(untracked, [ch("crates/codecs/ünï code.rs")]);
+        let p = plan(&[v, untracked].concat(), &pkgs(), "b".into());
+        assert_eq!(p.packages.iter().map(String::as_str).collect::<Vec<_>>(), ["lightcraft-codecs", "lightcraft-engine", "lightcraft-raw"]);
+    }
+
+    #[test]
+    fn embedded_files_outside_a_crate_test_the_crates_that_embed_them() {
+        let p = plan(&[ch("docs/raw/coverage-sweep.tsv")], &pkgs(), "b".into());
+        assert!(p.rust());
+        assert_eq!(p.packages.iter().map(String::as_str).collect::<Vec<_>>(), ["lightcraft-raw"]);
+        let p = plan(&[ch("assets/fonts/Inter-Regular.ttf")], &pkgs(), "b".into());
+        assert!(p.rust() && p.packages.contains("lightcraft-engine"));
+        // a consumer missing from the workspace's package list is not invented
+        assert!(!p.packages.contains("lightcraft-ui-egui"));
+        let p = plan(&[ch("assets/ATTRIBUTION.md"), ch("docs/raw-parity.md")], &pkgs(), "b".into());
+        assert!(!p.rust(), "only files something compiles in");
+    }
+
+    /// Every `include_str!` / `include_bytes!` of a file outside its package, and every `"../…"`
+    /// path in a build script, is listed in `EMBEDDED` for that package.
+    #[test]
+    fn embedded_files_are_mapped() {
+        use std::path::{Component, PathBuf};
+        fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() && p.file_name().is_some_and(|n| n != "target") {
+                    rs_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask is in the workspace").to_path_buf();
+        // `a/b/../c` -> `a/c`, relative to the root; None outside it
+        let normalize = |p: &Path| -> Option<String> {
+            let mut parts: Vec<String> = Vec::new();
+            for c in p.strip_prefix(&root).ok()?.components() {
+                match c {
+                    Component::ParentDir => {
+                        parts.pop()?;
+                    }
+                    Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+                    _ => {}
+                }
+            }
+            Some(parts.join("/"))
+        };
+        let mut files = Vec::new();
+        for d in ["crates", "apps", "xtask"] {
+            rs_files(&root.join(d), &mut files);
+        }
+        let (mut checked, mut missing) = (0, Vec::new());
+        for file in files {
+            let Ok(src) = std::fs::read_to_string(&file) else { continue };
+            // the package: the nearest directory with a Cargo.toml
+            let Some(pkg_dir) = file.ancestors().skip(1).find(|d| d.join("Cargo.toml").is_file()) else { continue };
+            let manifest = std::fs::read_to_string(pkg_dir.join("Cargo.toml")).unwrap_or_default();
+            let Some(name) = manifest.lines().find_map(|l| l.strip_prefix("name = \"")?.strip_suffix('"')) else { continue };
+            let Some(pkg_rel) = normalize(pkg_dir) else { continue };
+            let mut targets = Vec::new();
+            for mac in ["include_str!(", "include_bytes!("] {
+                for (i, _) in src.match_indices(mac) {
+                    let rest = src[i + mac.len()..].trim_start();
+                    if let Some(lit) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) {
+                        targets.push(file.parent().expect("a file has a directory").join(lit));
+                    }
+                }
+            }
+            if file.file_name().is_some_and(|n| n == "build.rs") {
+                for (i, _) in src.match_indices("\"../") {
+                    if let Some(lit) = src[i + 1..].split('"').next() {
+                        targets.push(pkg_dir.join(lit));
+                    }
+                }
+            }
+            for t in targets {
+                // outside the workspace (`../craft-fonts`), not a real file, or inside the package
+                let Some(rel) = normalize(&t) else { continue };
+                if !root.join(&rel).exists() || rel.starts_with(&format!("{pkg_rel}/")) {
+                    continue;
+                }
+                checked += 1;
+                // a directory (`rerun-if-changed=../../contributors`) needs a `dir/` entry
+                let rel = if root.join(&rel).is_dir() { format!("{rel}/") } else { rel };
+                if !embedders(&rel).any(|p| p == name) {
+                    missing.push(format!("{rel} (compiled into {name} by {})", file.display()));
+                }
+            }
+        }
+        assert!(checked > 0, "found no embedded files: the scan is broken");
+        assert!(missing.is_empty(), "add these to ci_quick::EMBEDDED:\n{}", missing.join("\n"));
     }
 }
