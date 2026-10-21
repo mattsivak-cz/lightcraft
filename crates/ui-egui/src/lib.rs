@@ -1132,7 +1132,12 @@ impl LightcraftApp {
         }
         self.ui.was_focused = focused;
         // Alt (Option on macOS) while a slider is dragged shows its temporary preview
-        self.ui.alt_held = ctx.input(|i| i.modifiers.alt);
+        self.ui.alt_held = ctx.input(|i| i.modifiers.alt && i.pointer.primary_down());
+        // a drag whose interaction ended where its slider never saw (a panel switch, a menu)
+        // is over: don't keep its preview or geometry grid for a later Alt press
+        if self.session.interaction.is_none() {
+            self.ui.dragging_control = None;
+        }
         // auto import: list the watched folder every few seconds (on a worker thread: it may be on
         // a network share), then import what's new like any import (also on a worker thread)
         #[cfg(not(target_arch = "wasm32"))]

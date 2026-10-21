@@ -764,8 +764,8 @@ pub struct UiState {
     /// The develop control whose slider is being dragged (geometry sliders show a grid).
     #[serde(skip)]
     pub dragging_control: Option<String>,
-    /// Alt (Option on macOS) is held this frame: a dragged Edit slider shows its temporary
-    /// preview ([`lightcraft_pipeline::Overlay::for_control`]).
+    /// Alt (Option on macOS) is held with the primary button down this frame: a dragged Edit
+    /// slider shows its temporary preview ([`lightcraft_pipeline::Overlay::for_control`]).
     #[serde(skip)]
     pub alt_held: bool,
     pub search: String,

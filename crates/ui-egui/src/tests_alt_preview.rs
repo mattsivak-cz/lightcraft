@@ -69,3 +69,44 @@ fn alt_during_a_blacks_drag_shows_shadow_clipping_until_released() {
     let after = h.app.session.develop_of(h.app.session.active().expect("photo")).expect("develop").light.blacks;
     assert!(after < before, "the drag itself still moved Blacks: {before} → {after}");
 }
+
+fn key(h: &mut Headless, key: egui::Key) {
+    for pressed in [true, false] {
+        h.app.synthetic.push(Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: Modifiers::NONE });
+    }
+}
+
+/// A drag that ends where the slider never sees it (I switches to the Info panel mid-drag and the
+/// button is released there) leaves no preview behind: Alt pressed later shows the photo.
+#[test]
+fn alt_after_a_drag_cut_short_by_a_panel_switch_shows_the_photo() {
+    use crate::state::RightPanel;
+    let mut h = detail();
+    let track = h.app.widgets.iter().find(|(w, _)| w == "slider:light.blacks").map(|(_, r)| *r).expect("Blacks slider on screen");
+    let from = track.center();
+    h.app.synthetic.push(Event::PointerMoved(from));
+    h.app.synthetic.push(Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    for i in 1..=8 {
+        h.app.synthetic.push(Event::PointerMoved(from - egui::vec2(6.0 * i as f32, 0.0)));
+    }
+    h.settle(SETTLE);
+    assert_eq!(h.app.ui.dragging_control.as_deref(), Some("light.blacks"));
+    key(&mut h, egui::Key::I);
+    h.settle(SETTLE);
+    assert_ne!(h.app.ui.right, RightPanel::Edit, "I leaves the Edit panel");
+    h.app.synthetic.push(Event::PointerButton {
+        pos: from - egui::vec2(48.0, 0.0),
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.settle(SETTLE);
+    key(&mut h, egui::Key::E);
+    h.settle(SETTLE);
+    assert_eq!(h.app.ui.right, RightPanel::Edit, "E brings the Edit panel back");
+    assert!(h.app.session.interaction.is_none(), "the drag's interaction is over");
+    h.app.synthetic.push(Event::ModifiersChanged(Modifiers::ALT));
+    h.settle(SETTLE);
+    assert_eq!(h.app.ui.dragging_control, None, "no slider is being dragged");
+    assert!(binary_share(&h) < 0.5, "Alt alone shows the photo, not a clipping view: {}", binary_share(&h));
+}
