@@ -756,6 +756,7 @@ impl Session {
                 return Err(err);
             }
         };
+        let joined = hashing::joined_library(&e.op);
         self.show_undone(&e.op);
         self.pending_log.push(e.op);
         self.redo.push(UndoEntry {
@@ -765,6 +766,7 @@ impl Session {
             retry_inverse: Vec::new(),
             retry_sidecars: Vec::new(),
         });
+        self.hash_joined(joined);
         Ok(e.label)
     }
 
@@ -781,6 +783,7 @@ impl Session {
                 return Err(err);
             }
         };
+        let joined = hashing::joined_library(&e.op);
         self.show_undone(&e.op);
         self.pending_log.push(e.op);
         self.undo.push(UndoEntry {
@@ -790,6 +793,7 @@ impl Session {
             retry_inverse: Vec::new(),
             retry_sidecars: Vec::new(),
         });
+        self.hash_joined(joined);
         Ok(e.label)
     }
 

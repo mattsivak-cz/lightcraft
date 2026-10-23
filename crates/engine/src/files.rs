@@ -1139,6 +1139,12 @@ fn file_modified(path: &str) -> Option<String> {
 const RAW_PREFIX: u64 = 512 * 1024;
 /// Rounds of reads [`read_raw_headers`] makes before giving up on reading a file in part.
 const RAW_ROUNDS: usize = 32;
+/// Tenths of a raw [`read_raw_headers`] may read before it gives up and the file is read whole:
+/// reading most of it in parts and then all of it again costs more than one whole read.
+const RAW_MAX_SHARE: u64 = 6;
+/// The largest raw [`read_raw_headers`] builds a buffer of the file's length for (as
+/// [`MAX_PREVIEW_PLAN_BYTES`]); a larger file is read whole.
+const RAW_MAX_BYTES: u64 = MAX_PREVIEW_PLAN_BYTES;
 
 /// The raw file at `path` (`len` bytes) read only where describing it looks
 /// ([`lightcraft_raw::sparse::header_plan`]): a buffer of the file's length holding those ranges, the
@@ -1147,7 +1153,7 @@ const RAW_ROUNDS: usize = 32;
 fn read_raw_headers(path: &str, len: u64) -> Option<Vec<u8>> {
     use lightcraft_raw::sparse::{HeaderPlan, Ranges, header_plan};
     use std::io::{Read, Seek, SeekFrom};
-    if len <= RAW_PREFIX {
+    if len <= RAW_PREFIX || len > RAW_MAX_BYTES {
         return None;
     }
     let mut buf = vec![0u8; usize::try_from(len).ok()?];
@@ -1160,11 +1166,16 @@ fn read_raw_headers(path: &str, len: u64) -> Option<Vec<u8>> {
     let mut loaded = Ranges::new();
     read(&mut buf, 0, RAW_PREFIX)?;
     loaded.insert(0, RAW_PREFIX);
+    let mut wanted = RAW_PREFIX;
     for _ in 0..RAW_ROUNDS {
         match header_plan(&buf, &loaded) {
             HeaderPlan::Ready => return Some(buf),
             HeaderPlan::Whole(_) => return None,
             HeaderPlan::Need(more) => {
+                wanted = more.spans().iter().fold(wanted, |w, &(a, b)| w.saturating_add(b.saturating_sub(a)));
+                if wanted.saturating_mul(10) > len.saturating_mul(RAW_MAX_SHARE) {
+                    return None;
+                }
                 for &(a, b) in more.spans() {
                     if loaded.overlaps(a, b) {
                         return None; // asked again: don't loop
