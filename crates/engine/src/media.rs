@@ -1330,8 +1330,12 @@ impl crate::Session {
     pub fn thumb_job(&mut self, id: PhotoId, long_edge: usize) -> Option<RenderJob> {
         let b = thumb_bucket(long_edge);
         let mut job = self.build_job(id, b, b, false, true, Some(b))?;
-        // (a thumbnail may develop a smaller copy of the raw image that the file keeps)
-        if let SourceRef::File { reduced, .. } = &mut job.source {
+        // (a thumbnail may develop a smaller copy of the raw image that the file keeps; not one shown whole, whose
+        // full-frame loader the reduced one would replace)
+        let full_frame = self.catalog.photo(id).is_some_and(|p| p.develop.crop.full_frame);
+        if let SourceRef::File { reduced, .. } = &mut job.source
+            && !full_frame
+        {
             reduced.clone_from(&self.media.reduced_loader);
         }
         Some(job)

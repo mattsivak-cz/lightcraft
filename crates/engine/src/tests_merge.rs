@@ -321,6 +321,19 @@ fn full_image_exports_at_the_whole_pictures_size() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A grid thumbnail of a photo shown whole is the whole picture too, not the default crop that a thumbnail's
+/// reduced-copy loader decodes.
+#[test]
+fn a_thumbnail_with_show_full_image_is_the_whole_picture() {
+    let (dir, mut s, id) = dng_with_default_crop("full-thumb");
+    s.execute("crop.fullFrame", &json!({"on": true})).unwrap();
+    s.media.clear_sources();
+    let thumb = s.thumb_job(id, 128).unwrap().run();
+    let image = &thumb.rendered.as_ref().unwrap().image;
+    assert!(image.width.abs_diff(image.height * 100 / 60) <= 1, "the whole picture's aspect: {}×{}", image.width, image.height);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A decode planned before Show Full Image was toggled that finishes after it doesn't put the old picture back.
 #[test]
 fn a_decode_from_before_full_image_is_not_kept() {
