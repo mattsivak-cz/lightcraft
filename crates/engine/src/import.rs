@@ -766,7 +766,11 @@ pub fn import_with(s: &mut Session, paths: &[String], opts: &ImportOptions) -> c
     let prepared = job.prepare(paths, &std::sync::atomic::AtomicBool::new(false));
     // probes a scan left for files not imported now stay for a later import
     s.import_probes.extend(std::mem::take(&mut job.cache));
-    commit_prepared(s, &job.opts, &job.now, prepared)
+    let report = commit_prepared(s, &job.opts, &job.now, prepared)?;
+    if !s.hash_in_background {
+        s.hash_queued_now();
+    }
+    Ok(report)
 }
 
 /// Everything the file-system half of an import needs, detached from the session so it can run
@@ -927,6 +931,8 @@ impl ImportJob {
             return Err(crate::EngineError::Other("copying or moving needs a destination folder or an open library".into()));
         }
         let fresh = opts.on_deleted == OnDeleted::Fresh;
+        // browsing reads only what describes a file (a network share holds thousands of raws)
+        let probe = if opts.local { s.media.file_probe_light.clone().or_else(|| s.media.file_probe.clone()) } else { s.media.file_probe.clone() };
         Ok(ImportJob {
             seq: opts.rename_start.max(1),
             opts,
@@ -936,7 +942,7 @@ impl ImportJob {
             library: Some((s.catalog.clone(), fresh)),
             by_path: HashMap::new(),
             by_hash: HashMap::new(),
-            probe: s.media.file_probe.clone(),
+            probe,
             file_bytes: s.media.file_bytes.clone(),
             cache: std::mem::take(&mut s.import_probes),
             naming: s.xmp.naming,
@@ -1362,6 +1368,8 @@ pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepare
     let now = now.to_string();
     let mut report = ImportReport { scanned: prepared.scanned, ..Default::default() };
     let mut ops = Vec::new();
+    // browsed (Local) photos imported for real: their content hashes are worked out afterwards
+    let mut promoted = Vec::new();
     // Move: placed at the destination, sources untouched until the records are committed
     let mut placed: Vec<crate::import_move::Placed> = Vec::new();
     // photos added by this batch, by content (a duplicate of a file earlier in the import names it)
@@ -1385,6 +1393,7 @@ pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepare
             PreparedItem::Promote(id) => {
                 if s.catalog.photo(id).is_some_and(|p| p.local) {
                     ops.push(Op::SetLocal { id, local: false });
+                    promoted.push(id);
                 }
                 report.imported.push(id.0);
             }
@@ -1491,6 +1500,7 @@ pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepare
     if !placed.is_empty() {
         finish_moves(s, placed, log0, &mut report);
     }
+    s.queue_hash(promoted);
     Ok(report)
 }
 
