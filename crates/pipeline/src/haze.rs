@@ -116,13 +116,12 @@ fn inv_air_lin(air: [f32; 3]) -> [f32; 3] {
 /// `min_c(e_c / A_c) = √min_c(lin_c / A_lin_c)`.
 #[inline]
 fn norm_dark_lin(lin: [f32; 3], inv: [f32; 3]) -> f32 {
-    let r = (0..3).fold(f32::INFINITY, |m, i| {
-        let v = lin[i];
-        let v = if v.is_finite() && v > 0.0 { v } else { 0.0 };
-        m.min(v * inv[i])
-    });
-    let g = encode(r);
-    if g.is_finite() { g.clamp(0.0, G_MAX) } else { 0.0 }
+    // (written without short-circuits so the per-pixel path has no branches: a NaN or infinite
+    // channel reads as 0, and `r ≥ 0` is never NaN; it overflows to +∞ only for a huge pixel,
+    // which `encode` reads as 0)
+    let pos = |v: f32| if v > 0.0 && v < f32::INFINITY { v } else { 0.0 };
+    let r = (pos(lin[0]) * inv[0]).min(pos(lin[1]) * inv[1]).min(pos(lin[2]) * inv[2]);
+    if r < f32::INFINITY { r.sqrt().min(G_MAX) } else { 0.0 }
 }
 
 /// One axis of the bilinear sampling: `(i0, i1, f)` of frame-normalised `n` (outside 0..1, the
@@ -359,8 +358,9 @@ pub struct Ctx {
     inv_top: f32,
     /// The airlight, linear and exposed.
     air_g: [f32; 3],
-    /// The colour negative amounts veil toward ([`veil_air`]), exposed.
-    veil_g: [f32; 3],
+    /// The square root of the colour negative amounts veil toward ([`veil_air`]), exposed: the veil
+    /// mixes in that encoding.
+    veil_g_sqrt: [f32; 3],
     /// Linear (pre-exposure) bounds of the pixels that can be within [`SKY_K`] of the airlight:
     /// a pixel with any channel outside them gets the full recovery without encoding it.
     sky_lo: [f32; 3],
@@ -381,7 +381,7 @@ impl Ctx {
             inv_air_lin: inv_air_lin(map.air),
             inv_top: 1.0 / top,
             air_g: map.air_lin().map(|v| v * gain),
-            veil_g: veil_air(map).map(|v| v * gain),
+            veil_g_sqrt: veil_air(map).map(|v| (v * gain).max(0.0).sqrt()),
             sky_lo: map.air.map(|a| decode(a - reach)),
             sky_hi: map.air.map(|a| decode(a + reach)),
         })
@@ -407,7 +407,8 @@ impl Ctx {
     /// airlight.
     #[inline]
     fn sky_weight(&self, lin: [f32; 3]) -> f32 {
-        if (0..3).all(|i| lin[i] >= self.sky_lo[i] && lin[i] <= self.sky_hi[i]) { sky_weight_at(self.sky_distance(encode3(lin))) } else { 1.0 }
+        let within = |i: usize| (lin[i] >= self.sky_lo[i]) & (lin[i] <= self.sky_hi[i]);
+        if within(0) & within(1) & within(2) { sky_weight_at(self.sky_distance(encode3(lin))) } else { 1.0 }
     }
 }
 
@@ -464,7 +465,7 @@ fn finish_recovery(am: &Amount, c: [f32; 3], mut j: [f32; 3], w: f32) -> [f32; 3
             j = std::array::from_fn(|i| j[i] + (c[i] * s - j[i]) * CHROMA_KEEP);
         }
     }
-    if j.iter().all(|v| v.is_finite()) { j } else { c }
+    if j[0].is_finite() & j[1].is_finite() & j[2].is_finite() { j } else { c }
 }
 
 /// The colour negative amounts veil toward (linear, pre-exposure): the airlight, scaled so its
@@ -497,21 +498,22 @@ fn recover_with(ctx: &Ctx, am: &Amount, c: [f32; 3], d: f32, sky: impl FnOnce() 
         let air = ctx.air_g;
         // the map measures haze in the encoding; the recovery is linear, so is its haze share
         // (`min(e/A)` of an encoded pixel is `√min(c/A)` of the linear one)
-        let t = (1.0 - am.omega * decode(d)).max(am.tmin);
+        let t = (1.0 - am.omega * d * d).max(am.tmin);
         // sky tolerance: pixels close to the airlight colour are left nearly alone; the gain
-        // above 1 fades in smoothly over 0..SKY_K, so the horizon gets no band
+        // above 1 fades in smoothly over 0..SKY_K, so the horizon gets no band. The gain is
+        // `1 / clamp(t / (t + (1 − t)·s), T_FLOOR, 1)`, one division (`t ≥ tmin > 0`)
         let s = sky();
-        let inv_t = 1.0 / (t / (t + (1.0 - t) * s).max(1e-6)).clamp(T_FLOOR, 1.0);
+        let inv_t = ((t + (1.0 - t) * s).max(1e-6) / t).clamp(1.0, 1.0 / T_FLOOR);
         (std::array::from_fn(|i| (air[i] + (c[i] - air[i]) * inv_t).max(0.0)), s)
     } else if am.k < 0.0 {
         // a veil toward the airlight, mixed in a square-root encoding (lifts the shadows more
         // than the median)
         let t = 1.0 - VEIL * -am.k * (VEIL_BASE + (1.0 - VEIL_BASE) * d);
-        let mix = |v: f32, a: f32| {
-            let r = v.max(0.0).sqrt() * t + a.max(0.0).sqrt() * (1.0 - t);
+        let mix = |v: f32, a_sqrt: f32| {
+            let r = v.max(0.0).sqrt() * t + a_sqrt * (1.0 - t);
             r * r
         };
-        (std::array::from_fn(|i| mix(c[i], ctx.veil_g[i])), 1.0)
+        (std::array::from_fn(|i| mix(c[i], ctx.veil_g_sqrt[i])), 1.0)
     } else {
         (c, 1.0)
     }

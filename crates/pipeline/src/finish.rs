@@ -432,6 +432,25 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         // the map's two proxy rows around this output row, blended once (on the first pixel that
         // dehazes)
         let mut haze_row: Option<crate::haze::HazeRow> = None;
+        // V4 Dehaze at the global amount of each pixel of the row as the main loop would see it
+        // without masks (`raw · gain`), in a tight pass of its own: its square roots and divisions
+        // then overlap from pixel to pixel, which they can't inside the long loop below (about
+        // twice as fast). Pixels whose colour or amount masks change dehaze in the loop.
+        let haze_pre: Vec<[f32; 3]> = match (&p.haze, &haze) {
+            (Some(map), Some((ctx, global))) if dehaze != 0.0 => {
+                let hr = haze_row.insert(map.row((vy + y as f32 + 0.5) / vh));
+                let src = p.img.data.get(y * w..(y + 1) * w).unwrap_or(&[]);
+                src.iter()
+                    .zip(&haze_cols)
+                    .map(|(raw, col)| {
+                        let c = if gain == 1.0 { *raw } else { raw.map(|v| v * gain) };
+                        let (a, b) = hr.coeffs(col);
+                        crate::haze::dehaze_at(ctx, global, a, b, c)
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         for (x, px) in row.iter_mut().enumerate() {
             let i = y * w + x;
             let raw = p.img.data[i];
@@ -457,6 +476,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let [l_exp, l_temp, l_tint, l_con, l_hl, l_sh, l_wh, l_bl, l_tex, l_clar, l_dehaze, l_sat, l_hue, l_sharp, l_noise, l_moire, l_defringe] =
                 l;
 
+            // (whether a mask changed the colour before Dehaze: `haze_pre` doesn't hold it then)
+            let mut recoloured = false;
             // --- local Moiré (and the colour part of Noise): chromaticity towards its blur
             let mt = (l_moire + 0.5 * l_noise.max(0.0)).clamp(-1.0, 1.0);
             if mt != 0.0
@@ -464,6 +485,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             {
                 let (y, ch0, cb) = (luminance_2020(c), crate::masks::chromaticity(raw), cb.data[i]);
                 c = std::array::from_fn(|k| ((ch0[k] + (cb[k] - ch0[k]) * mt) * y).max(0.0));
+                recoloured = true;
             }
             // --- local Defringe: desaturate purple / green fringes along edges
             let df = l_defringe.clamp(0.0, 1.0);
@@ -474,6 +496,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 if k > 0.0 {
                     let y = luminance_2020(c);
                     c = c.map(|v| v + (y - v) * k);
+                    recoloured = true;
                 }
             }
 
@@ -484,7 +507,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             {
                 // V4: the whole frame's haze map, sampled where this pixel sits in the whole
                 // output frame (a window dehazes like the whole render)
-                if let Some((ctx, global)) = &haze {
+                if l_dehaze == 0.0
+                    && !recoloured
+                    && let Some(pre) = haze_pre.get(x)
+                {
+                    c = *pre;
+                } else if let Some((ctx, global)) = &haze {
                     let hr = haze_row.get_or_insert_with(|| map.row((vy + y as f32 + 0.5) / vh));
                     let (a, b) = haze_cols.get(x).map_or((0.0, 0.0), |col| hr.coeffs(col));
                     let am = if l_dehaze == 0.0 { *global } else { crate::haze::Amount::new(map, dz) };
